@@ -181,3 +181,15 @@ establish current provider retention or account pricing.
 also verifies the lock, installs locked dependencies and builds distributions.
 Use the repository's Universal Pad engineering workspace for material changes.
 See `THIRD_PARTY_NOTICES.md` for reused MIT code and PMXT data attribution.
+
+## Repeatable live smoke test
+
+Run from this repository after `uv sync --locked`. This is opt-in; ordinary tests and CI stay offline.
+
+```sh
+uv run --locked python -m polymarket_market_data.smoke --events-report /absolute/path/to/events/report.json --events-executable /absolute/path/to/events/.venv/bin/catalogue
+```
+
+Every invocation creates a fresh ignored `data/smoke/<uuid>` root and prints the absolute `report.json` path. Use `--output <fresh-path>` to name a run. Never reuse an output directory. Reports retain the steps, measured requests/bytes, configured limits and coverage. Failed/timed-out commands make `accounting_complete` false; their totals are known lower bounds. No paid requests are made. Run the events smoke first and pass its report to the consumers; consumers validate and pin its metadata bundle. Select an explicit currently active, unambiguous market when the example market closes.
+
+A pass requires nonempty exact price samples, authoritative live book states, resume, deterministic semantic replay, publication and root verification. A separate eight-second real WebSocket probe deliberately closes its first connection and requires fresh snapshots after reconnect. The explicit events executable refreshes metadata into the smoke root; it is never taken from the report. Acquisition commands allow 10 attempts/8 MiB each; reconnect allows 5 attempts/8 MiB. Recording defaults to 15 seconds and is capped at 60. Paid history and free archives are not exercised by this smoke.
