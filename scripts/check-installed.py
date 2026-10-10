@@ -28,42 +28,24 @@ def main():
         environment = {
             key: value
             for key, value in os.environ.items()
-            if key not in {"PYTHONPATH", "PYTHONHOME", "PMXT_API_KEY"}
+            if key
+            not in {"PYTHONPATH", "PYTHONHOME", "PMXT_API_KEY", "UV_PROJECT", "UV_WORKING_DIR"}
             and not key.startswith("CATALOGUE_")
         }
-        requirements = directory / "requirements.txt"
-        checked(
-            [
-                uv,
-                "export",
-                "--locked",
-                "--no-dev",
-                "--no-emit-project",
-                "--format",
-                "requirements-txt",
-                "--output-file",
-                str(requirements),
-            ],
-            cwd=repository,
-            env=environment,
-            stdout=subprocess.DEVNULL,
-        )
         venv = directory / "venv"
         checked([uv, "venv", "--python", sys.executable, str(venv)], env=environment)
         python = venv / "bin" / "python"
         checked(
             [
                 uv,
-                "pip",
-                "install",
+                "sync",
+                "--locked",
                 "--offline",
-                "--python",
-                str(python),
-                "--require-hashes",
-                "--requirements",
-                str(requirements),
+                "--no-dev",
+                "--no-install-project",
             ],
-            env=environment,
+            cwd=repository,
+            env={**environment, "UV_PROJECT_ENVIRONMENT": str(venv)},
         )
         built_requirement = directory / "wheel.txt"
         built_requirement.write_text(
