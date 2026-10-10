@@ -11,7 +11,7 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .archives import ATTRIBUTION, archive_coverage, archive_hours, iter_archive
+from .archives import ATTRIBUTION, DECODER_REVISION, archive_coverage, archive_hours, iter_archive
 from .books import UPDATE_SCHEMA
 from .budget import BudgetLedger
 from .build import build
@@ -25,7 +25,7 @@ from .feeds import (
     utc,
     window,
 )
-from .foundation import BudgetExceeded, Limits, Store, json_bytes, json_loads
+from .foundation import Limits, Store, json_bytes
 from .metadata import pin_metadata, select_assets
 from .recorder import record
 from .transport import Client, SourceError
@@ -54,6 +54,19 @@ def parser():
         ("temp-bytes", 512 * 1024**2),
     ):
         plan.add_argument("--max-" + name, type=int, default=default)
+    workflow = commands.add_parser("run", help="Collect, verify and publish selected free feeds")
+    workflow.add_argument("--resume-run")
+    workflow.add_argument("--market-id", action="append")
+    workflow.add_argument(
+        "--feed", choices=("clob-history", "clob-ws", "pmxt-v1", "pmxt-v2"), action="append"
+    )
+    workflow.add_argument("--start")
+    workflow.add_argument("--end")
+    workflow.add_argument("--fidelity", type=int)
+    workflow.add_argument("--duration", type=int)
+    workflow.add_argument("--events-executable", type=Path)
+    for name in ("requests", "download-bytes", "storage-bytes", "response-bytes", "temp-bytes"):
+        workflow.add_argument("--max-" + name, type=int)
     for name in ("prices", "books", "archive", "trades"):
         parent = commands.add_parser(name)
         actions = parent.add_subparsers(dest="action", required=True)
@@ -231,6 +244,7 @@ def _backfill(store, args):
         account=getattr(args, "account", None),
         period=getattr(args, "period", None),
         allowance_id=getattr(args, "allowance_id", None),
+        run_meter=getattr(store, "run_meter", None),
     ) as client:
         request = _cached_request(store, acquisition_id, client, source)
         for target in plan["assets"]:
@@ -311,7 +325,12 @@ def _archive(store, args):
         capture["unit_id"]: capture
         for capture in store.committed_captures(acquisition_id=acquisition_id)
     }
-    with Client("archive", store.limits, storage_root=store.root) as client:
+    with Client(
+        "archive",
+        store.limits,
+        storage_root=store.root,
+        run_meter=getattr(store, "run_meter", None),
+    ) as client:
         for item in archive_hours(plan["start"], plan["end"], args.version):
             unit = "hour-" + item["hour"].strftime("%Y%m%dT%H")
             if unit in existing:
@@ -338,12 +357,14 @@ def _archive(store, args):
             temporary = Path(tempfile.mkdtemp(prefix=".archive-", dir=store.root / ".state"))
             try:
                 path = temporary / "source.parquet"
+                pinned = existing.get("source-object-" + unit)
                 previous = [
                     capture for key, capture in existing.items() if key.startswith(unit + "-batch-")
                 ]
-                if previous:
+                if pinned or previous:
                     objects = [
-                        store.read_evidence(capture)["source_object"] for capture in previous
+                        store.read_evidence(capture)["source_object"]
+                        for capture in ([pinned] if pinned else []) + previous
                     ]
                     if any(value != objects[0] for value in objects):
                         raise ValueError("partial archive batches disagree on pinned source object")
@@ -372,27 +393,41 @@ def _archive(store, args):
                         )
                         continue
                     object_info = store.retain_object(path)
+                store.capture(
+                    acquisition_id,
+                    "source-object-" + unit,
+                    {},
+                    evidence={
+                        "source_object": object_info,
+                        "url": item["url"],
+                        "etag": receipt.get("etag"),
+                        "attribution": ATTRIBUTION,
+                    },
+                    objects=[object_info],
+                )
                 counts = {}
-                for ordinal, (updates, accounting) in enumerate(
-                    iter_archive(
-                        store.object_path(object_info),
-                        version=args.version,
-                        targets=plan["assets"],
-                        start=lower,
-                        end=upper,
-                        hour=item["hour"],
-                        object_sha256=object_info["sha256"],
-                        max_decoded_bytes=store.limits.max_temp_bytes,
-                        max_row_bytes=store.limits.max_response_bytes,
-                    )
+                for updates, accounting in iter_archive(
+                    store.object_path(object_info),
+                    version=args.version,
+                    targets=plan["assets"],
+                    start=lower,
+                    end=upper,
+                    hour=item["hour"],
+                    object_sha256=object_info["sha256"],
+                    max_decoded_bytes=store.limits.max_temp_bytes,
+                    max_row_bytes=store.limits.max_response_bytes,
                 ):
                     for update in updates:
                         key = update["asset_kind"], update["asset_id"]
                         if update["kind"] != "reset":
                             counts[key] = counts.get(key, 0) + 1
+                    if not updates:
+                        continue
+                    first_row = accounting["first_row"]
+                    stop_row = first_row + accounting["source_rows"]
                     store.capture(
                         acquisition_id,
-                        f"{unit}-batch-{ordinal}",
+                        f"{unit}-batch-decoder{DECODER_REVISION}-rows-{first_row}-{stop_row}",
                         {"book_updates": updates},
                         evidence={
                             "source_object": object_info,
@@ -433,76 +468,19 @@ def _archive(store, args):
 
 
 def _refresh_live_metadata(store, plan, args, client):
+    from .runner import refresh_metadata
+
     store.limits = Limits.from_dict(plan["limits"])
-    remaining_requests = client.limits.max_requests - client.requests
-    remaining_download = client.limits.max_download_bytes - client.downloaded
-    if remaining_requests <= 0 or remaining_download <= 0:
-        raise BudgetExceeded("metadata refresh invocation request/download limit exhausted")
-    store._budget()
-    retained = sum(path.stat().st_size for path in store.root.rglob("*") if path.is_file())
-    output_budget = min(
-        store.limits.max_temp_bytes // 2, (store.limits.max_storage_bytes - retained) // 2
+    bundle = refresh_metadata(
+        store, plan["market_ids"], args.events_executable, args.events_root, client=client
     )
-    if output_budget <= 0:
-        raise ValueError("metadata refresh requires available temporary and retained storage")
-    with tempfile.TemporaryDirectory(prefix=".metadata-", dir=store.root / ".state") as temporary:
-        directory = Path(temporary) / "bundle"
-        argv = [
-            args.events_executable,
-            "metadata",
-            "refresh",
-            "--output",
-            str(directory),
-            "--max-output-bytes",
-            str(output_budget),
-            "--max-response-bytes",
-            str(min(store.limits.max_response_bytes, 8 * 1024**2)),
-            "--max-requests",
-            str(remaining_requests),
-            "--max-download-bytes",
-            str(remaining_download),
-        ]
-        for market_id in plan["market_ids"]:
-            argv.extend(["--market-id", market_id])
-        result = subprocess.run(
-            argv,
-            env={**os.environ, "CATALOGUE_ROOT": str(args.events_root.absolute())},
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        reply = json_loads(result.stdout) if result.stdout.strip() else {}
-        if not isinstance(reply, dict):
-            raise ValueError("selected metadata refresh returned invalid diagnostics")
-        if reply:
-            attempts, downloaded = reply.get("http_attempts"), reply.get("downloaded_bytes")
-            if not all(
-                isinstance(value, int) and not isinstance(value, bool) and value >= 0
-                for value in (attempts, downloaded)
-            ):
-                raise ValueError("selected metadata refresh lacks valid resource accounting")
-            client.requests += attempts
-            client.downloaded += downloaded
-            if (
-                client.requests > client.limits.max_requests
-                or client.downloaded > client.limits.max_download_bytes
-            ):
-                raise BudgetExceeded("metadata refresh exceeded invocation request/download budget")
-        if result.returncode:
-            raise ValueError("selected metadata refresh failed or busy")
-        if not reply:
-            raise ValueError("selected metadata refresh lacks resource accounting")
-        bundle = pin_metadata(store.root, directory, reply["manifest_sha256"], store=store)
-        assets = select_assets(bundle, plan["market_ids"])
-        baseline = {
-            (row["asset_kind"], row["asset_id"], row.get("condition_id")) for row in plan["assets"]
-        }
-        if {
-            (row["asset_kind"], row["asset_id"], row.get("condition_id")) for row in assets
-        } != baseline:
-            raise ValueError("selected identities changed; create a new plan")
-        return bundle
+    assets = select_assets(bundle, plan["market_ids"])
+    fields = ("venue", "market_id", "asset_kind", "asset_id", "condition_id", "outcome_index")
+    if {tuple(row.get(field) for field in fields) for row in assets} != {
+        tuple(row.get(field) for field in fields) for row in plan["assets"]
+    }:
+        raise ValueError("selected identities changed; create a new plan")
+    return bundle
 
 
 def _record(store, args):
@@ -512,9 +490,18 @@ def _record(store, args):
     if "clob-ws" not in plan["feeds"]:
         raise ValueError("live feed is not in the sealed plan")
     store.limits = Limits.from_dict(plan["limits"])
-    with Client("clob", store.limits, storage_root=store.root) as client:
+    with Client(
+        "clob", store.limits, storage_root=store.root, run_meter=getattr(store, "run_meter", None)
+    ) as client:
         metadata = _refresh_live_metadata(store, plan, args, client)
-        acquisition_id = store.new_acquisition(args.plan, "clob-ws")
+        acquisition_id = getattr(args, "_acquisition_id", None) or store.new_acquisition(
+            args.plan, "clob-ws"
+        )
+        if (
+            store.acquisition(acquisition_id)["plan_id"] != args.plan
+            or store.acquisition(acquisition_id)["source"] != "clob-ws"
+        ):
+            raise ValueError("live acquisition mismatch")
         counter = 0
 
         async def emit(rows, evidence, covered):
@@ -555,6 +542,10 @@ def _record(store, args):
 
 
 def _run_locked(store, args):
+    if args.command == "run":
+        from .runner import run as workflow
+
+        return workflow(store, args)
     if args.command == "plan":
         return _plan(store, args)
     if (

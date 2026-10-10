@@ -51,7 +51,7 @@ def build(store, plan_id, acquisition_ids):
     if not acquisition_ids or len(set(acquisition_ids)) != len(acquisition_ids):
         raise ValueError("build requires distinct explicit acquisition IDs")
     captures, covered = [], []
-    for acquisition_id in acquisition_ids:
+    for acquisition_id in sorted(acquisition_ids):
         acquisition = store.acquisition(acquisition_id)
         if acquisition["plan_id"] != plan_id:
             raise ValueError("acquisition belongs to another plan")
@@ -100,10 +100,12 @@ def build(store, plan_id, acquisition_ids):
             row["source_at"],
         )
         if key in seen:
-            if seen[key] != row["price"]:
+            if seen[key]["price"] != row["price"]:
                 raise ValueError("conflicting prices inside one capture identity")
+            if any(seen[key][name] != row[name] for name, _ in IDENTITY_FIELDS):
+                raise ValueError("conflicting sample identity inside one capture bucket")
             continue
-        seen[key] = row["price"]
+        seen[key] = row
         append("price_samples", row)
         bucket = utc(row["source_at"]).replace(second=0, microsecond=0)
         groups[
@@ -113,6 +115,9 @@ def build(store, plan_id, acquisition_ids):
         groups.items()
     ):
         rows.sort(key=lambda row: row["source_at"])
+        identity = {name: rows[0][name] for name, _ in IDENTITY_FIELDS}
+        if any(any(row[name] != value for name, value in identity.items()) for row in rows):
+            raise ValueError("conflicting sample identity inside one capture bucket")
         prices = [Decimal(row["price"]) for row in rows]
         append(
             "sampled_ohlc",
@@ -120,9 +125,7 @@ def build(store, plan_id, acquisition_ids):
                 "source": source,
                 "acquisition_id": acquisition_id,
                 "capture_id": capture_id,
-                "venue": venue,
-                "asset_kind": asset_kind,
-                "asset_id": asset_id,
+                **identity,
                 "bucket_start": bucket,
                 "bucket_end": bucket + timedelta(minutes=1),
                 "open": prices[0],

@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from polymarket_market_data import cli
+from polymarket_market_data import cli, runner
 from polymarket_market_data.archives import V1_SCHEMA
 from polymarket_market_data.build import build
 from polymarket_market_data.feeds import PRICE_SCHEMA, coverage
@@ -294,9 +294,9 @@ def test_live_metadata_output_is_temporary_and_removed_on_failure(tmp_path, monk
         (output / "unfinished").write_text("source data")
         return SimpleNamespace(returncode=2, stdout="")
 
-    monkeypatch.setattr(cli.subprocess, "run", producer)
+    monkeypatch.setattr(runner, "bounded_run", producer)
     args = SimpleNamespace(events_executable="catalogue", events_root=tmp_path)
-    with pytest.raises(ValueError, match="failed or busy"):
+    with pytest.raises(ValueError, match="valid resource accounting"):
         cli._refresh_live_metadata(store, plan_data, args, meter())
     assert seen and not seen[0].exists()
     assert list((store.root / "inputs").iterdir()) == []
@@ -318,7 +318,7 @@ def test_live_metadata_success_leaves_only_one_pinned_copy(tmp_path, monkeypatch
             ).decode(),
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", producer)
+    monkeypatch.setattr(runner, "bounded_run", producer)
     bundle = cli._refresh_live_metadata(
         store,
         plan_data,
@@ -613,7 +613,7 @@ def test_partial_archive_resume_keeps_original_object_after_remote_change(tmp_pa
     with pytest.raises(RuntimeError):
         cli.run(args)
     acquisition = next((store.root / "acquisitions").iterdir()).name
-    assert len(store.committed_captures(acquisition_id=acquisition)) == 1
+    assert len(store.committed_captures(acquisition_id=acquisition)) == 2
     monkeypatch.setattr(Store, "capture", original)
     args.resume = acquisition
     result = cli.run(args)
@@ -639,7 +639,7 @@ def test_live_metadata_producer_receives_budget_caps(tmp_path, monkeypatch):
             ).decode(),
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", producer)
+    monkeypatch.setattr(runner, "bounded_run", producer)
     cli._refresh_live_metadata(
         store,
         plan_data,
@@ -671,7 +671,7 @@ def test_delegated_metadata_refreshes_share_one_invocation_budget(tmp_path, monk
             ).decode(),
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", producer)
+    monkeypatch.setattr(runner, "bounded_run", producer)
     args = SimpleNamespace(events_executable="catalogue", events_root=tmp_path)
     for _ in range(3):
         cli._refresh_live_metadata(store, plan_data, args, client)
@@ -686,8 +686,8 @@ def test_failed_delegated_metadata_accounts_attempts_and_partial_bytes(tmp_path,
     plan_data = store.load_plan(plan(store))
     client = meter()
     monkeypatch.setattr(
-        cli.subprocess,
-        "run",
+        runner,
+        "bounded_run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=2,
             stdout=json_bytes(
@@ -744,7 +744,7 @@ def test_startup_metadata_consumes_last_request_before_ws_connection(tmp_path, m
             ).decode(),
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", producer)
+    monkeypatch.setattr(runner, "bounded_run", producer)
 
     async def record(**kwargs):
         kwargs["charge_request"]()

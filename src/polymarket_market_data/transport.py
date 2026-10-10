@@ -35,6 +35,20 @@ class SourceError(ValueError):
         super().__init__(message)
 
 
+class _ClosedStream(httpx.SyncByteStream):
+    """A response flag is set before stream.close; confirm the actual close returned."""
+
+    def __init__(self, stream, closed=False):
+        self.stream, self.closed = stream, closed
+
+    def __iter__(self):
+        yield from self.stream
+
+    def close(self):
+        self.stream.close()
+        self.closed = True
+
+
 def validate_url(source, url, resolve=True):
     try:
         parsed = urlsplit(url)
@@ -79,6 +93,7 @@ class Client:
         retries=3,
         sleep=time.sleep,
         storage_root=None,
+        run_meter=None,
     ):
         if source not in {*HOSTS, "rpc"}:
             raise ValueError("unknown source")
@@ -86,6 +101,7 @@ class Client:
             raise ValueError("retry attempts must be 1..4")
         self.source, self.limits, self.rpc_url = source, limits, rpc_url
         self.storage_root = Path(storage_root) if storage_root is not None else None
+        self.run_meter = run_meter
         self.paid_ledger, self.account, self.period, self.allowance_id = (
             paid_ledger,
             account,
@@ -123,9 +139,14 @@ class Client:
         self.requests += 1
 
     def reserve_request(self):
+        reservation = self.run_meter.reserve(1, 0, "websocket attempt") if self.run_meter else None
         self._reserve()
+        if reservation:
+            self.run_meter.settle(reservation, 1, 0)
 
     def count_bytes(self, size):
+        if self.run_meter:
+            self.run_meter.charge_bytes(size)
         self._count(size)
 
     def _count(self, size):
@@ -154,11 +175,26 @@ class Client:
     def _request(self, method, url, params=None, json=None, headers=None, destination=None):
         self._validate(method, url, json)
         for attempt in range(self.retries):
+            maximum = (
+                self.limits.max_temp_bytes
+                if destination
+                else min(self.limits.max_response_bytes, self.limits.max_temp_bytes)
+            )
+            reservation = None
+            if self.run_meter:
+                maximum = min(maximum, self.run_meter.remaining[1])
+                if maximum <= 0:
+                    raise BudgetExceeded("run downloaded-byte limit exhausted")
+                reservation = self.run_meter.reserve(1, maximum, "HTTP attempt")
+            downloaded_before = self.downloaded
+            close_guard = None
             self._reserve()
             try:
                 with self.client.stream(
                     method, url, params=params, json=json, headers=headers
                 ) as response:
+                    close_guard = _ClosedStream(response.stream, response.is_closed)
+                    response.stream = close_guard
                     status = response.status_code
                     if response.headers.get("content-encoding", "identity").lower() != "identity":
                         raise SourceError("invalid", "unexpected encoded HTTP body")
@@ -167,9 +203,7 @@ class Client:
                         for chunk in response.iter_bytes():
                             self._count(len(chunk))
                             failed_size += len(chunk)
-                            if failed_size > min(
-                                self.limits.max_response_bytes, self.limits.max_temp_bytes
-                            ):
+                            if failed_size > min(maximum, self.limits.max_response_bytes):
                                 raise BudgetExceeded("error response byte limit exhausted")
                     if 300 <= status < 400:
                         raise SourceError("invalid", "source redirect refused")
@@ -204,13 +238,6 @@ class Client:
                             for chunk in response.iter_bytes():
                                 size += len(chunk)
                                 self._count(len(chunk))
-                                maximum = (
-                                    self.limits.max_temp_bytes
-                                    if destination
-                                    else min(
-                                        self.limits.max_response_bytes, self.limits.max_temp_bytes
-                                    )
-                                )
                                 if destination and retained + size > self.limits.max_storage_bytes:
                                     raise BudgetExceeded("retained storage limit exhausted")
                                 if size > maximum:
@@ -240,6 +267,9 @@ class Client:
                 if attempt + 1 == self.retries:
                     raise SourceError("failed", "source transport attempts exhausted") from None
                 delay = min(10, 2**attempt)
+            finally:
+                if reservation and close_guard is not None and close_guard.closed:
+                    self.run_meter.settle(reservation, 1, self.downloaded - downloaded_before)
             self.sleep(delay)
         raise SourceError("failed")
 

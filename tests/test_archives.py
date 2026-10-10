@@ -173,7 +173,7 @@ def test_compressed_archive_footer_is_checked_before_deserialization(tmp_path):
     }
     pq.write_table(pa.Table.from_pylist([row], schema=V1_SCHEMA), path, compression="zstd")
     assert path.stat().st_size < 64 * 1024
-    with pytest.raises(BudgetExceeded, match="uncompressed footer"):
+    with pytest.raises(BudgetExceeded, match="row-group decode"):
         list(
             iter_archive(
                 path,
@@ -244,14 +244,19 @@ def test_dictionary_repetition_is_bounded_before_arrow_deserialization(tmp_path,
     batches = []
 
     class TracedFile:
-        def __init__(self, filename):
-            self.file = original(filename)
+        def __init__(self, filename, **kwargs):
+            self.file = original(filename, **kwargs)
             self.metadata, self.schema_arrow = self.file.metadata, self.file.schema_arrow
+            assert kwargs["pre_buffer"] is False
+            self.dictionary = kwargs.get("read_dictionary")
 
-        def iter_batches(self, *, batch_size):
+        def iter_batches(self, *, batch_size, row_groups, use_threads):
             batches.append(batch_size)
-            assert batch_size <= (16 * 1024**2) // (4 * uncompressed)
-            yield from self.file.iter_batches(batch_size=batch_size)
+            assert batch_size <= 2048 and use_threads is False
+            assert self.dictionary and "data" in self.dictionary
+            yield from self.file.iter_batches(
+                batch_size=batch_size, row_groups=row_groups, use_threads=use_threads
+            )
 
     monkeypatch.setattr(archives.pq, "ParquetFile", TracedFile)
     result = list(
@@ -263,7 +268,7 @@ def test_dictionary_repetition_is_bounded_before_arrow_deserialization(tmp_path,
             end=NOW + timedelta(hours=1),
             hour=NOW,
             object_sha256="digest",
-            max_decoded_bytes=16 * 1024**2,
+            max_decoded_bytes=32 * 1024**2,
         )
     )
     assert batches and sum(len(rows) for rows, _ in result) == 20
@@ -289,8 +294,8 @@ def test_oversized_dictionary_group_is_rejected_before_arrow_decode(tmp_path, mo
     original = pq.ParquetFile
 
     class UnreadFile:
-        def __init__(self, filename):
-            file = original(filename)
+        def __init__(self, filename, **kwargs):
+            file = original(filename, **kwargs)
             self.metadata, self.schema_arrow = file.metadata, file.schema_arrow
 
         def iter_batches(self, **kwargs):

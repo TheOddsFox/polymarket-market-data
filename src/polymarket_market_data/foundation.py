@@ -7,8 +7,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -57,8 +59,6 @@ def digest(value):
 def read_bytes(path, maximum=128 * 1024**2):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        import stat
-
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
             raise ValueError("invalid or oversized regular file")
@@ -149,8 +149,6 @@ def write_parquet(path, rows, schema=None):
 def file_info(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        import stat
-
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("expected regular evidence file")
         hasher, size = hashlib.sha256(), 0
@@ -186,6 +184,38 @@ def verify_directory(directory):
     return manifest
 
 
+class _EvidenceLock(FileLock):
+    """Verified source objects live only as long as the outer writer operation."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._object_state = threading.local()
+
+    def acquire(self, *args, **kwargs):
+        result = super().acquire(*args, **kwargs)
+        if self.lock_counter == 1:
+            self._object_state.cache = {}
+        return result
+
+    def release(self, force=False):
+        try:
+            super().release(force)
+        finally:
+            if not self.is_locked:
+                self._object_state.cache = None
+
+    @property
+    def object_cache(self):
+        return getattr(self._object_state, "cache", None) if self.is_locked else None
+
+
+def _fingerprint(path):
+    info = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("expected regular evidence file")
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 class Store:
     def __init__(self, root, contract, limits=None):
         root = Path(root).absolute()
@@ -213,7 +243,7 @@ class Store:
         self.root, self.contract, self.limits = root, contract, limits
         if (root / ".writer.lock").is_symlink():
             raise ValueError("symlink writer lock")
-        self.lock = FileLock(root / ".writer.lock", timeout=0)
+        self.lock = _EvidenceLock(root / ".writer.lock", timeout=0)
         with self.lock:
             for name in ("inputs", "plans", "acquisitions", "published", "objects", ".state"):
                 path = root / name
@@ -352,55 +382,83 @@ class Store:
                     shutil.rmtree(pending)
 
     def committed_captures(self, acquisition_id=None, plan_id=None):
-        captures = []
-        roots = (
-            [self.root / "acquisitions" / self._name(acquisition_id)]
-            if acquisition_id
-            else sorted((self.root / "acquisitions").iterdir())
-        )
-        for directory in roots:
-            for capture in sorted((directory / "captures").iterdir()):
-                if capture.name.startswith(".pending-"):
-                    continue
-                value = verify_directory(capture)
-                if (
-                    value.get("contract") != self.contract + ".capture"
-                    or value.get("schema_version") != 1
-                ):
-                    raise ValueError("unsupported capture contract/schema revision")
-                for obj in value.get("objects", []):
-                    self.object_path(obj)
-                if plan_id is None or value["plan_id"] == plan_id:
-                    captures.append(value)
-        return captures
+        with self.lock:
+            captures = []
+            roots = (
+                [self.root / "acquisitions" / self._name(acquisition_id)]
+                if acquisition_id
+                else sorted((self.root / "acquisitions").iterdir())
+            )
+            for directory in roots:
+                for capture in sorted((directory / "captures").iterdir()):
+                    if capture.name.startswith(".pending-"):
+                        continue
+                    value = self._verify_capture(capture)
+                    if plan_id is None or value["plan_id"] == plan_id:
+                        captures.append(value)
+            return captures
+
+    def _verify_capture(self, path):
+        if path.parent.is_symlink() or path.parent.parent.is_symlink():
+            raise ValueError("symlink capture parent")
+        value = verify_directory(path)
+        if value.get("contract") != self.contract + ".capture" or value.get("schema_version") != 1:
+            raise ValueError("unsupported capture contract/schema revision")
+        if (
+            value["capture_id"] != path.name
+            or value["acquisition_id"] != path.parent.parent.name
+            or digest(json_bytes([value["acquisition_id"], value["unit_id"]])) != path.name
+        ):
+            raise ValueError("capture identity mismatch")
+        for obj in value.get("objects", []):
+            self.object_path(obj)
+        return value
 
     def retain_object(self, path):
         path = Path(path)
-        info = file_info(path)
-        destination = self.root / "objects" / info["sha256"]
         with self.lock:
+            before = _fingerprint(path)
+            info = file_info(path)
+            if _fingerprint(path) != before:
+                raise ValueError("source object changed during verification")
+            reference = {"path": "objects/" + info["sha256"], **info}
+            destination = self.root / reference["path"]
             if destination.exists():
-                if file_info(destination) != info:
-                    raise ValueError("source object integrity mismatch")
+                self.object_path(reference)
             else:
                 self._budget(0 if path.is_relative_to(self.root) else info["size"])
                 if not path.is_relative_to(self.root / ".state"):
                     raise ValueError("source object must be downloaded inside root state")
                 os.rename(path, destination)
                 fsync_dir(destination.parent)
-        return {"path": "objects/" + info["sha256"], **info}
+                retained = _fingerprint(destination)
+                if retained[:4] != before[:4]:
+                    raise ValueError("source object changed during retention")
+                self.lock.object_cache[(info["sha256"], info["size"])] = retained
+        return reference
 
     def object_path(self, info):
         if info.get("path") != "objects/" + info.get("sha256", "") or not re.fullmatch(
             r"[0-9a-f]{64}", info.get("sha256", "")
         ):
             raise ValueError("unsafe source object reference")
+        if isinstance(info.get("size"), bool) or not isinstance(info.get("size"), int):
+            raise ValueError("unsafe source object size")
         path = self.root / "objects" / info["sha256"]
-        if path.parent.is_symlink() or file_info(path) != {
-            "sha256": info["sha256"],
-            "size": info["size"],
-        }:
-            raise ValueError("source object reference mismatch")
+        with self.lock:
+            if path.parent.is_symlink():
+                raise ValueError("source object reference mismatch")
+            before = _fingerprint(path)
+            key = info["sha256"], info["size"]
+            cache = self.lock.object_cache
+            if cache.get(key) != before:
+                cache.pop(key, None)
+                actual = file_info(path)
+                if _fingerprint(path) != before:
+                    raise ValueError("source object changed during verification")
+                if actual != {"sha256": info["sha256"], "size": info["size"]}:
+                    raise ValueError("source object reference mismatch")
+                cache[key] = before
         return path
 
     def capture_path(self, capture):
@@ -485,8 +543,13 @@ class Store:
                     shutil.rmtree(pending)
 
     def verify(self, release_id=None):
+        with self.lock:
+            return self._verify(release_id)
+
+    def _verify(self, release_id=None):
         if release_id:
-            manifest = verify_directory(self.root / "published" / self._name(release_id))
+            directory = self.root / "published" / self._name(release_id)
+            manifest = verify_directory(directory)
             if manifest["contract"] != self.contract:
                 raise ValueError("release contract mismatch")
             identity = {
@@ -507,21 +570,25 @@ class Store:
             ):
                 raise ValueError("immutable release identity mismatch")
             plan = self.load_plan(manifest["plan_id"])
+            if read_json(directory / "plan.json") != plan:
+                raise ValueError("release plan input mismatch")
             for key in ("metadata_sha256", "metadata_manifest_sha256", "metadata_digest"):
                 if key in plan:
                     from .metadata import load_metadata
 
                     load_metadata(self.root / "inputs" / plan[key], plan[key])
-            captures = {
-                c["capture_id"]: c for c in self.committed_captures(plan_id=manifest["plan_id"])
-            }
-            if any(value not in captures for value in manifest["inputs"]):
-                raise ValueError("release capture input missing")
+            if set(manifest["inputs"]) != set(manifest["input_manifests"]):
+                raise ValueError("release capture input inventory mismatch")
             for capture_id, expected in manifest["input_manifests"].items():
-                if (
-                    digest(read_bytes(self.capture_path(captures[capture_id]) / "manifest.json"))
-                    != expected
-                ):
+                paths = list(
+                    (self.root / "acquisitions").glob("*/captures/" + self._name(capture_id))
+                )
+                if len(paths) != 1:
+                    raise ValueError("release capture input missing or ambiguous")
+                capture = self._verify_capture(paths[0])
+                if capture["plan_id"] != manifest["plan_id"]:
+                    raise ValueError("release capture plan mismatch")
+                if digest(read_bytes(paths[0] / "manifest.json")) != expected:
                     raise ValueError("release capture manifest drift")
             if any(c.get("status") in UNRESOLVED for c in manifest["coverage"]):
                 raise ValueError("unresolved published coverage")
