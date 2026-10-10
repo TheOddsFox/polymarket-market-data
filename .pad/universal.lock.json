@@ -1,0 +1,12 @@
+{
+  "files": {
+    ".agents/skills/pad-engineering/SKILL.md": "3cb5185116663c2f8ee58764a4180784ff2604b05e2e75b2b6f13cc1ccfd0071",
+    "AGENTS.md": "8e0e7df28f0df8d847f4981da0978c28c2c9615b0382c3bfc62c6af90a52f6b1",
+    "PROJECT_AGENT.md": "6b5970d090220e9cdd239d8a668a234f23113f0e4ce2be8529929abd2ec80e35",
+    "scripts/verify": "5a82b086e23a65aa148a0a15c231c6d14e528167700b9cdf9368ae72b52469b4",
+    "scripts/verify-fast": "9861093c992527dc15135999f9d9e2a8e8b68e46fed3c232a9de1f76f3747743"
+  },
+  "repository": "oddsfox-polymarket-market-data",
+  "version": "1.1.0",
+  "workspace": "oddsfox-polymarket-market-data-engineering"
+}

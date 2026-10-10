@@ -218,3 +218,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Operator data and credentials
+data/
+.state/
+artifacts/
+captures/
+*.duckdb*
+*.sqlite*
+*.parquet
+.env*
+!.env.example
+*.pem
+*.key
+dist/
+build/
+.venv/
