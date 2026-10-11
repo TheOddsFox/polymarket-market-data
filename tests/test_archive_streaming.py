@@ -106,14 +106,22 @@ def test_many_row_groups_exceed_whole_file_budget_but_stream_safely(tmp_path):
     metadata = pq.ParquetFile(path).metadata
     assert sum(metadata.row_group(i).total_byte_size for i in range(13)) > 2 * 1024**2
     result = list(decode(path, max_decoded_bytes=2 * 1024**2, max_row_bytes=1024))
+    data_batches = [
+        (updates, accounting)
+        for updates, accounting in result
+        if not accounting.get("group_complete")
+    ]
     assert sum(len(updates) for updates, _ in result) == 1
-    assert result[-1][0][0]["sequence"] == 12
-    assert result[-1][0][0]["raw_identity"] == "digest:12:0"
-    assert result[-1][1] == {
+    assert data_batches[-1][0][0]["sequence"] == 12
+    assert data_batches[-1][0][0]["raw_identity"] == "digest:12:0"
+    assert data_batches[-1][1] == {
         "decoder_revision": DECODER_REVISION,
         "first_row": 12,
         "source_rows": 1,
     }
+    completed = [accounting for _, accounting in result if accounting.get("group_complete")]
+    assert [accounting["row_group"] for accounting in completed] == list(range(13))
+    assert all(accounting["source_rows"] == 0 for accounting in completed)
 
 
 def test_unselected_rows_are_filtered_before_python_strings_and_json(tmp_path, monkeypatch):
@@ -210,7 +218,13 @@ def test_batches_are_capped_and_each_row_group_is_read_separately(tmp_path, monk
         {"batch_size": 2048, "row_groups": [0], "use_threads": False},
         {"batch_size": 2048, "row_groups": [1], "use_threads": False},
     ]
-    assert [accounting["first_row"] for _, accounting in result] == [0, 2048, 3000]
+    data_batches = [accounting for _, accounting in result if not accounting.get("group_complete")]
+    assert [accounting["first_row"] for accounting in data_batches] == [0, 2048, 3000]
+    completed = [accounting for _, accounting in result if accounting.get("group_complete")]
+    assert [
+        (accounting["row_group"], accounting["group_first_row"], accounting["group_stop_row"])
+        for accounting in completed
+    ] == [(0, 0, 3000), (1, 3000, 5000)]
     assert sum(len(updates) for updates, _ in result) == 5000
 
 

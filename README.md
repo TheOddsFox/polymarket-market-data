@@ -212,8 +212,10 @@ credits. Separate API keys do not establish separate account allowances.
 - Resume historical or archive work with the same `--plan` and `--resume
   ACQUISITION_ID`. Verified committed requests and units are reused. A new
   acquisition deliberately observes the source again. An unfinished archive hour
-  with committed batches replays its pinned original object, even if the remote
-  object changes. Cached HTTP responses retain their original receive timestamps.
+  resumes its pinned original object, even if the remote object changes. It skips
+  only a contiguous chain of verified complete row groups; an interrupted group
+  replays from its beginning and reuses canonical data batches. Cached HTTP
+  responses retain their original receive timestamps.
 - Live sessions cannot resume. An interrupted session remains incomplete; start
   a new session and preserve the earlier gap evidence.
 - Each invocation counts requests, retries and partially downloaded bytes.
@@ -236,6 +238,18 @@ credits. Separate API keys do not establish separate account allowances.
   a missing financial ledger.
 
 WebSocket download accounting includes connection ingress, partial fragments and control frames; compression is disabled. The message and queue allocation are capped by the sealed temporary-byte limit. Paid accounting also reserves SQLite database and journal headroom before writes.
+
+Archive decoder revision 2 retains physical row positions and batches of at most
+2,048 rows. Progress revision 1 adds immutable, metadata-only receipts after each
+row group is fully scanned, including groups with no selected data. Each receipt
+binds the preceding receipt, pinned object and this group's nonempty data captures;
+the completed hour binds the final receipt. Resume verifies their identities,
+hashes, physical spans and persisted observation counts before skipping a prefix.
+Missing or corrupt referenced evidence fails closed without replacement downloads.
+Legacy partial acquisitions replay the pinned object fully and adopt progress
+receipts; completed legacy acquisitions remain unchanged. Progress receipts
+increase capture totals without adding observations or coverage. Coverage remains
+non-additive observation receipts at its documented acquisition/capture grain.
 
 Production readiness requires bounded real cases for every selected typed asset:
 current history, authoritative live snapshots and fresh snapshots after reconnect,

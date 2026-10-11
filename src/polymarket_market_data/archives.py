@@ -21,6 +21,8 @@ ATTRIBUTION = {
     "changes": "Selected native assets and normalized displayed-book replay",
 }
 DECODER_REVISION = 2
+PROGRESS_REVISION = 1
+ARCHIVE_BATCH_SIZE = 2048
 
 V1_SCHEMA = pa.schema(
     [
@@ -121,35 +123,18 @@ def archive_message(row, version):
     return message
 
 
-def iter_archive(
-    path: Path,
-    *,
-    version,
-    targets,
-    start,
-    end,
-    hour,
-    object_sha256,
-    batch_size=2048,
-    max_decoded_bytes=512 * 1024**2,
-    max_row_bytes=16 * 1024**2,
-):
-    """Yield selected updates in original file order, never timestamp-sort deltas."""
-    start, end = window(start, end)
-    source = f"pmxt-{version}"
-    supported = [
-        target
-        for target in targets
-        if CAPABILITIES[source].get(target["asset_kind"]) == "supported"
-    ]
-    conditions = {target.get("condition_id") for target in supported}
+def archive_preflight(path, *, version, max_decoded_bytes):
+    """Validate the complete footer, including groups that continuation will skip."""
+    if version not in ("v1", "v2"):
+        raise ValueError("archive version must be v1 or v2")
     schema = V1_SCHEMA if version == "v1" else V2_SCHEMA
     physical = pq.ParquetFile(path, pre_buffer=False)
     if not physical.schema_arrow.equals(schema, check_metadata=False):
         raise ValueError(f"unsupported PMXT {version} archive schema")
-    if not all(
-        isinstance(value, int) and not isinstance(value, bool) and value > 0
-        for value in (max_decoded_bytes, max_row_bytes, batch_size)
+    if (
+        not isinstance(max_decoded_bytes, int)
+        or isinstance(max_decoded_bytes, bool)
+        or max_decoded_bytes <= 0
     ):
         raise ValueError("archive decode limits must be positive integers")
     metadata = physical.metadata
@@ -185,8 +170,58 @@ def iter_archive(
     ]
     if max(decode_sizes, default=0) > max_decoded_bytes or metadata.num_rows and not maximum_group:
         raise BudgetExceeded("archive row-group decode exceeds temporary budget")
+    spans, offset = [], 0
+    for group in range(metadata.num_row_groups):
+        stop = offset + metadata.row_group(group).num_rows
+        if stop < offset:
+            raise ValueError("invalid archive row-group span")
+        spans.append((offset, stop))
+        offset = stop
+    if offset != metadata.num_rows:
+        raise ValueError("archive footer row counts disagree")
+    return spans, dictionary_columns
+
+
+def iter_archive(
+    path: Path,
+    *,
+    version,
+    targets,
+    start,
+    end,
+    hour,
+    object_sha256,
+    batch_size=ARCHIVE_BATCH_SIZE,
+    start_row_group=0,
+    max_decoded_bytes=512 * 1024**2,
+    max_row_bytes=16 * 1024**2,
+):
+    """Yield selected updates in original file order, never timestamp-sort deltas."""
+    start, end = window(start, end)
+    source = f"pmxt-{version}"
+    supported = [
+        target
+        for target in targets
+        if CAPABILITIES[source].get(target["asset_kind"]) == "supported"
+    ]
+    conditions = {target.get("condition_id") for target in supported}
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (max_decoded_bytes, max_row_bytes, batch_size)
+    ):
+        raise ValueError("archive decode limits must be positive integers")
+    spans, dictionary_columns = archive_preflight(
+        path, version=version, max_decoded_bytes=max_decoded_bytes
+    )
+    if (
+        not isinstance(start_row_group, int)
+        or isinstance(start_row_group, bool)
+        or not 0 <= start_row_group <= len(spans)
+    ):
+        raise ValueError("archive start_row_group is outside the footer")
+    schema = V1_SCHEMA if version == "v1" else V2_SCHEMA
     row_limit = min(max_row_bytes, max_decoded_bytes // 16)
-    batch_size = min(batch_size, 2048)
+    batch_size = min(batch_size, ARCHIVE_BATCH_SIZE)
     condition_field = "market_id" if version == "v1" else "market"
     condition_values = pa.array(
         sorted(condition for condition in conditions if condition is not None)
@@ -195,8 +230,8 @@ def iter_archive(
         type=schema.field(condition_field).type,
     )
     stream = f"{source}/{hour.isoformat()}/{object_sha256}"
-    offset = 0
-    for group in range(metadata.num_row_groups):
+    offset = sum(stop - first for first, stop in spans[:start_row_group])
+    for group in range(start_row_group, len(spans)):
         # Preserve source dictionaries; encoding unique PLAIN JSON adds an unbounded hash table.
         parquet = pq.ParquetFile(path, read_dictionary=dictionary_columns[group], pre_buffer=False)
         for batch in parquet.iter_batches(
@@ -219,6 +254,20 @@ def iter_archive(
                 row_limit=row_limit,
             )
             offset += batch.num_rows
+        if offset != spans[group][1]:
+            raise ValueError("archive decoded row count disagrees with footer")
+        yield (
+            [],
+            {
+                "decoder_revision": DECODER_REVISION,
+                "first_row": offset,
+                "source_rows": 0,
+                "group_complete": True,
+                "row_group": group,
+                "group_first_row": spans[group][0],
+                "group_stop_row": spans[group][1],
+            },
+        )
 
 
 def _archive_batch(
