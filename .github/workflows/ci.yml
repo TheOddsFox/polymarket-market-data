@@ -22,3 +22,4 @@ jobs:
       - run: scripts/verify
       - run: uv run --locked python scripts/check-distributions.py dist
       - run: uv run --locked python scripts/check-installed.py
+      - run: uv run --locked python scripts/benchmark-offline.py --repetitions 1

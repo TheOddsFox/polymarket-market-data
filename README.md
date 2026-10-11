@@ -263,6 +263,89 @@ also verifies the lock, installs locked dependencies and builds distributions.
 Use the repository's Universal Pad engineering workspace for material changes.
 See `THIRD_PARTY_NOTICES.md` for reused MIT code and PMXT data attribution.
 
+## Offline performance evidence
+
+Run the repeatable benchmark from the checkout with locked development dependencies:
+
+```sh
+uv run --locked python scripts/benchmark-offline.py --repetitions 3 \
+  --baseline-ref 5631a6585fe997b797f53c74bcb10c9feff08fd6 \
+  --output data/benchmarks/audit-offline.json
+```
+
+It records repeated storage measurements at 0, 100, 200 and 400 captures,
+mocked JSON responses with 0, 1,200 and 5,000 unrelated files, and a synthetic
+four-group archive interrupted after two completed receipts. CI checks operation
+counts and correctness with one repetition; elapsed time is evidence, not a CI
+threshold. Warm inventory checks use the lock's scalar total. Product inventories,
+explicit fresh reconciliations and benchmark sampling are counted separately.
+
+The cached comparison requires the previously verified archive root and makes no
+new downloads. Stop its other writers before running:
+
+```sh
+uv run --locked python scripts/benchmark-offline.py --repetitions 3 \
+  --baseline-ref 5631a6585fe997b797f53c74bcb10c9feff08fd6 \
+  --cached-root data/smoke/e2e-archive-accepted-20261010 \
+  --cached-repetitions 2 --deadline-seconds 600 \
+  --output data/benchmarks/audit-cached.json
+```
+
+The comparison locks and validates the canonical fixture, copies its pinned
+objects into disposable roots, then runs v1 and v2 sequentially. Each baseline
+and candidate starts from the same stopped, late-interrupted root. A shared
+600-second deadline covers export, copies, decoding, verification, comparison,
+restore and cleanup. Aggregate retained storage is capped at 16 GiB and temporary
+resources at 2 GiB. Worker limits remain enforced; sampled peaks can miss brief
+excursions. Reports include revisions, object hashes, runtime versions, physical
+groups and rows decoded, selected observations, requests/bytes, phase times and
+worker peak RSS. Semantic comparison preserves row multiplicity, typed identities,
+exact decimals, stream positions and times while excluding ingestion and capture
+provenance. A missing fixture, timeout or unequal result returns a nonzero status
+and incomplete evidence; the PR remains draft until real measurements pass.
+
+Measured on 11 October 2026, three local repetitions compared baseline
+`5631a658` with candidate production code `820ba93`, using Python 3.12.13,
+PyArrow 24.0.0 and DuckDB 1.5.6. The table gives medians across repetitions:
+
+| Offline measurement | Baseline | Candidate |
+|---|---:|---:|
+| Create 400 one-row captures | 21.887 s | 1.656 s |
+| Whole-root walks within that operation, including warm checks | 1,229 | 1 |
+| Warm inventory check at 400 captures | 32.975 ms | 0.041 ms |
+| Mocked JSON response with 5,000 unrelated files | 36.094 ms | 0.050 ms |
+| Whole-root walks for 51 mocked JSON responses | 51 | 0 |
+
+Candidate JSON responses also performed zero walks with 0 and 1,200 files and
+with managed Store accounting. A new writer operation performed a fresh inventory.
+The synthetic interrupted and uninterrupted archives matched all seven relation
+schemas and row multiplicities, rebuilt deterministically and passed restore.
+These timings describe this warmed local filesystem and are not general latency
+guarantees. Raw repetitions and provenance are retained in the ignored
+`data/benchmarks/audit-offline-20261011.json` report.
+
+The cached real-object comparison also passed on 11 October 2026, with two
+repetitions per version for market `1975743`, 14 April 08:00–09:00 UTC:
+
+| Version | Baseline groups / rows decoded | Candidate groups / rows decoded | Baseline / candidate median resume seconds |
+|---|---:|---:|---:|
+| PMXT v1 | 46 / 45,480,186 | 12 / 11,356,794 | 6.292 / 3.373 |
+| PMXT v2 | 55 / 57,351,791 | 14 / 14,360,175 | 8.338 / 2.142 |
+
+Both revisions produced six non-reset updates per version, three per selected
+outcome, with valid reconstructed states for both outcomes. All seven relations
+matched exactly under the documented provenance exclusions. Rebuilds retained
+release identity, completed resumes decoded no groups, and one stopped-writer
+restore per version passed verification, replay, consumer queries and resume.
+Every worker reported zero network attempts, requests and downloaded bytes.
+The complete comparison, including cleanup, took 181.002 seconds; canonical root
+verification accounted for 66.726 seconds. Sampled retained storage peaked at
+2,835,805,814 bytes and sampled temporary storage at 41,094 bytes. The highest
+reported worker peak RSS was 181,370,880 bytes. Baseline runs
+preceded candidate runs, so these are warmed-cache continuation measurements.
+The ignored `data/benchmarks/audit-cached-20261011.json` report contains each
+repetition, object SHA-256, worker RSS, capture categories and phase times.
+
 ## Repeatable live smoke test
 
 This is opt-in; ordinary tests and CI stay offline. Run with an installed package
