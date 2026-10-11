@@ -1,7 +1,47 @@
 import hashlib
 import importlib.util
 import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "relative_path", ["scripts/check-installed.py", "tests/fakes/installed_workflow.py"]
+)
+@pytest.mark.parametrize("optimization", ["-O", "-OO", "1", "2"])
+def test_installed_acceptance_refuses_optimization_before_setup(
+    tmp_path, relative_path, optimization
+):
+    repository = Path(__file__).resolve().parents[1]
+    script = tmp_path / Path(relative_path).name
+    script.write_bytes((repository / relative_path).read_bytes())
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"PYTHONPATH", "PYTHONHOME", "PYTHONOPTIMIZE"}
+    }
+    flags = []
+    if optimization.startswith("-"):
+        flags.append(optimization)
+    else:
+        environment["PYTHONOPTIMIZE"] = optimization
+    result = subprocess.run(
+        [sys.executable, "-S", *flags, str(script), "unused-environment"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert result.stderr.strip() == (
+        "installed acceptance requires Python assertions; disable optimization"
+    )
+    assert result.stdout == ""
+    assert list(tmp_path.iterdir()) == [script]
 
 
 def test_installed_bootstrap_uses_locked_cache_and_isolated_environment(tmp_path, monkeypatch):

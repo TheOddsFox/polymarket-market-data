@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import tempfile
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pyarrow.parquet as pq
 
+from . import acquisitions, producer
+from .build import build
 from .foundation import (
     BudgetExceeded,
     Limits,
@@ -20,13 +20,11 @@ from .foundation import (
     digest,
     fsync_dir,
     json_bytes,
-    json_loads,
     now,
     read_bytes,
     read_json,
 )
-from .metadata import MAX_BUNDLE, pin_metadata, select_assets
-from .producer import bounded_run, environment
+from .metadata import select_assets
 
 FREE_FEEDS = ("clob-history", "clob-ws", "pmxt-v1", "pmxt-v2")
 DEFAULTS = {
@@ -66,10 +64,7 @@ class RunMeter:
             self._nonnegative(value["requests"])
             self._nonnegative(value["downloaded_bytes"])
 
-    @staticmethod
-    def _nonnegative(value):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError("invalid run resource accounting")
+    _nonnegative = staticmethod(producer.nonnegative)
 
     @property
     def charged(self):
@@ -132,89 +127,6 @@ class RunMeter:
         self.save()
         if self.charged[1] > self.limits.max_download_bytes:
             raise BudgetExceeded("run downloaded-byte limit exhausted")
-
-
-def refresh_metadata(store, market_ids, events_executable, events_root=None, *, client=None):
-    """Use a fresh managed producer root so ambient configuration cannot choose sources or paths."""
-    meter = getattr(store, "run_meter", None)
-    remaining = (
-        meter.remaining
-        if meter
-        else (
-            store.limits.max_requests - (client.requests if client else 0),
-            store.limits.max_download_bytes - (client.downloaded if client else 0),
-        )
-    )
-    if min(remaining) <= 0:
-        raise BudgetExceeded("metadata refresh request/download limit exhausted")
-    store._budget()
-    retained = sum(path.stat().st_size for path in store.root.rglob("*") if path.is_file())
-    output_budget = min(
-        MAX_BUNDLE,
-        store.limits.max_temp_bytes // 4,
-        (store.limits.max_storage_bytes - retained) // 4,
-    )
-    if output_budget <= 0:
-        raise BudgetExceeded("metadata refresh requires available temporary and retained storage")
-    reservation = meter.reserve(*remaining, "metadata producer") if meter else None
-    with tempfile.TemporaryDirectory(prefix=".metadata-", dir=store.root / ".state") as temporary:
-        directory = Path(temporary) / "bundle"
-        producer_root = Path(temporary) / "events"
-        producer_root.mkdir()
-        argv = [
-            str(events_executable),
-            "metadata",
-            "refresh",
-            "--output",
-            str(directory),
-            "--max-output-bytes",
-            str(output_budget),
-            "--max-response-bytes",
-            str(min(store.limits.max_response_bytes, 8 * 1024**2)),
-            "--max-requests",
-            str(remaining[0]),
-            "--max-download-bytes",
-            str(remaining[1]),
-        ]
-        for market_id in market_ids:
-            argv.extend(["--market-id", market_id])
-        result = bounded_run(
-            argv,
-            env=environment(
-                producer_root,
-                replace(
-                    store.limits,
-                    max_requests=remaining[0],
-                    max_download_bytes=remaining[1],
-                    max_storage_bytes=store.limits.max_storage_bytes - retained - output_budget,
-                    max_temp_bytes=store.limits.max_temp_bytes - output_budget,
-                ),
-            ),
-            directory=temporary,
-            store=store,
-            max_diagnostics=min(64 * 1024, store.limits.max_temp_bytes),
-        )
-        try:
-            reply = json_loads(result.stdout) if result.stdout.strip() else {}
-            if not isinstance(reply, dict):
-                raise ValueError
-            attempts, downloaded = reply["http_attempts"], reply["downloaded_bytes"]
-            RunMeter._nonnegative(attempts)
-            RunMeter._nonnegative(downloaded)
-        except (ValueError, UnicodeError, KeyError):
-            raise ValueError("selected metadata refresh lacks valid resource accounting") from None
-        if client:
-            client.requests += attempts
-            client.downloaded += downloaded
-        if meter:
-            meter.settle(reservation, attempts, downloaded)
-        elif attempts > remaining[0] or downloaded > remaining[1]:
-            raise BudgetExceeded("metadata refresh exceeded invocation request/download budget")
-        if result.returncode:
-            raise ValueError("selected metadata refresh failed or busy")
-        if not isinstance(reply.get("manifest_sha256"), str):
-            raise ValueError("selected metadata refresh lacks manifest digest")
-        return pin_metadata(store.root, directory, reply["manifest_sha256"], store=store)
 
 
 class RunJournal:
@@ -436,8 +348,6 @@ def _report(store, journal, manifest=None, before=(0, 0)):
 
 
 def run(store, args):
-    from . import cli
-
     with store.lock:
         resume_id = getattr(args, "resume_run", None)
         journal = RunJournal(store, resume_id, None if resume_id else _settings(args))
@@ -454,7 +364,7 @@ def run(store, args):
                 store.verify()
                 return _report(store, journal, manifest, before)
             if not journal.data["plan_id"]:
-                bundle = refresh_metadata(
+                bundle = producer.refresh_metadata(
                     store, settings["market_ids"], settings["events_executable"]
                 )
                 assets = select_assets(bundle, settings["market_ids"])
@@ -494,19 +404,14 @@ def run(store, args):
                     acquisition_id = store.new_acquisition(plan_id, source)
                     journal.data["acquisitions"][source] = acquisition_id
                     journal.write()
-                stage_args = SimpleNamespace(
-                    plan=plan_id,
-                    action="backfill",
-                    resume=acquisition_id,
-                    events_executable=settings["events_executable"],
-                    events_root=store.root / ".state",
-                )
                 if source == "clob-history":
-                    stage_args.command = "prices"
-                    cli._backfill(store, stage_args)
+                    acquisitions.backfill(
+                        store, plan_id=plan_id, source=source, resume_id=acquisition_id
+                    )
                 elif source.startswith("pmxt-"):
-                    stage_args.command, stage_args.version = "archive", source[5:]
-                    cli._archive(store, stage_args)
+                    acquisitions.archive(
+                        store, plan_id=plan_id, version=source[5:], resume_id=acquisition_id
+                    )
                 else:
                     # shortcut: a crashed live session consumes its entire grant; upgrade only
                     # when a transport can durably report closure and partial ingress after crashes.
@@ -523,11 +428,15 @@ def run(store, args):
                         {},
                     )
                     store.run_meter = stage_meter
-                    stage_args.command, stage_args.action = "books", "record"
-                    stage_args.resume, stage_args._acquisition_id = None, acquisition_id
                     known_termination = False
                     try:
-                        cli._record(store, stage_args)
+                        acquisitions.record(
+                            store,
+                            plan_id=plan_id,
+                            events_executable=settings["events_executable"],
+                            events_root=store.root / ".state",
+                            acquisition_id=acquisition_id,
+                        )
                         known_termination = True
                     except (ValueError, OSError):
                         known_termination = True
@@ -549,7 +458,7 @@ def run(store, args):
                 journal.write()
             if not journal.data["release_id"]:
                 journal.stage("build")
-                journal.data["release_id"] = cli.build(
+                journal.data["release_id"] = build(
                     store, plan_id, list(journal.data["completed_acquisitions"].values())
                 )
                 journal.write()

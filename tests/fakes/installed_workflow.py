@@ -1,5 +1,8 @@
 """Standalone fixture copied beside a fresh installed environment; no checkout imports."""
 
+if not __debug__:
+    raise SystemExit("installed acceptance requires Python assertions; disable optimization")
+
 import contextlib
 import io
 import json
@@ -14,7 +17,7 @@ import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from polymarket_market_data import cli
+from polymarket_market_data import acquisitions, cli
 from polymarket_market_data.archives import V1_SCHEMA, V2_SCHEMA
 from polymarket_market_data.books import normalize_message, resets
 from polymarket_market_data.feeds import coverage
@@ -170,7 +173,7 @@ def workflow(environment_path):
             ],
         )
 
-    cli.Client, cli.record = client, recording
+    acquisitions.Client, acquisitions.record_messages = client, recording
     result = command(
         root,
         "run",

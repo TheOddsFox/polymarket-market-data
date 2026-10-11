@@ -12,7 +12,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from polymarket_market_data import cli, runner
+from polymarket_market_data import acquisitions, cli, runner
+from polymarket_market_data import producer as metadata_producer
 from polymarket_market_data.archives import V1_SCHEMA, V2_SCHEMA
 from polymarket_market_data.books import normalize_message
 from polymarket_market_data.feeds import coverage
@@ -90,13 +91,13 @@ def producer(monkeypatch):
             json_bytes({"manifest_sha256": sha, "http_attempts": 1, "downloaded_bytes": 100}),
         )
 
-    monkeypatch.setattr(runner, "bounded_run", invoke)
+    monkeypatch.setattr(metadata_producer, "bounded_run", invoke)
     return calls
 
 
 def mock_client(monkeypatch, handler):
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args, **kwargs, transport=httpx.MockTransport(handler), sleep=lambda _: None
@@ -165,7 +166,7 @@ def test_run_all_free_sources_then_completed_resume_is_offline(tmp_path, monkeyp
             [coverage(TARGET, "clob-ws", NOW, NOW + timedelta(seconds=60), "success")],
         )
 
-    monkeypatch.setattr(cli, "record", recording)
+    monkeypatch.setattr(acquisitions, "record_messages", recording)
     store = Store(tmp_path / "root", cli.CONTRACT)
     report = runner.run(store, arguments(feed=list(runner.FREE_FEEDS)))
     assert set(report["sources"]) == set(runner.FREE_FEEDS)
@@ -254,7 +255,9 @@ def test_download_limit_crossing_is_recorded_without_clamping():
 def test_resume_rejects_changed_inputs_before_io(tmp_path, monkeypatch, change):
     store = Store(tmp_path / "root", cli.CONTRACT)
     journal = RunJournal(store, settings=runner._settings(arguments()))
-    monkeypatch.setattr(runner, "refresh_metadata", lambda *args, **kwargs: pytest.fail("IO"))
+    monkeypatch.setattr(
+        metadata_producer, "refresh_metadata", lambda *args, **kwargs: pytest.fail("IO")
+    )
     with pytest.raises(ValueError, match="resume"):
         runner.run(store, arguments(resume_run=journal.run_id, **change))
 
@@ -292,10 +295,12 @@ def test_failed_metadata_without_diagnostics_keeps_full_grant(tmp_path, monkeypa
     journal = RunJournal(store, settings=runner._settings(arguments(max_requests=7)))
     store.run_meter = journal.meter
     monkeypatch.setattr(
-        runner, "bounded_run", lambda *args, **kwargs: subprocess.CompletedProcess([], 2, b"")
+        metadata_producer,
+        "bounded_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 2, b""),
     )
     with pytest.raises(ValueError, match="accounting"):
-        runner.refresh_metadata(store, ["1"], "events")
+        metadata_producer.refresh_metadata(store, ["1"], "events")
     assert journal.meter.charged == (7, 4 * 1024**3)
 
 
@@ -304,14 +309,14 @@ def test_failed_metadata_with_diagnostics_settles_measured_usage(tmp_path, monke
     journal = RunJournal(store, settings=runner._settings(arguments(max_requests=7)))
     store.run_meter = journal.meter
     monkeypatch.setattr(
-        runner,
+        metadata_producer,
         "bounded_run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             [], 2, json_bytes({"http_attempts": 2, "downloaded_bytes": 17})
         ),
     )
     with pytest.raises(ValueError, match="failed or busy"):
-        runner.refresh_metadata(store, ["1"], "events")
+        metadata_producer.refresh_metadata(store, ["1"], "events")
     assert journal.meter.charged == (2, 17)
 
 
@@ -374,7 +379,9 @@ def test_publication_failure_is_resumable_without_new_acquisition(tmp_path, monk
 
 def test_paid_feed_is_rejected_before_metadata(tmp_path, monkeypatch):
     store = Store(tmp_path / "root", cli.CONTRACT)
-    monkeypatch.setattr(runner, "refresh_metadata", lambda *args, **kwargs: pytest.fail("IO"))
+    monkeypatch.setattr(
+        metadata_producer, "refresh_metadata", lambda *args, **kwargs: pytest.fail("IO")
+    )
     with pytest.raises(ValueError, match="free feeds"):
         runner.run(store, arguments(feed=["pmxt-trades"]))
 
@@ -409,17 +416,17 @@ def test_known_live_interruption_preserves_session_and_starts_new_id(
 ):
     sessions = []
 
-    def recording(store, args):
-        sessions.append(args._acquisition_id)
+    def recording(store, *, acquisition_id, **kwargs):
+        sessions.append(acquisition_id)
         token = store.run_meter.reserve(1, 0, "WS attempt")
         store.run_meter.settle(token, 1, 0)
         store.run_meter.charge_bytes(10)
         if len(sessions) == 1:
-            store.capture(args._acquisition_id, "partial-session", {})
+            store.capture(acquisition_id, "partial-session", {})
             raise OSError("connection terminated")
-        return cli._finish(store, args._acquisition_id)
+        return acquisitions._finish(store, acquisition_id)
 
-    monkeypatch.setattr(cli, "_record", recording)
+    monkeypatch.setattr(acquisitions, "record", recording)
     store = Store(tmp_path / "root", cli.CONTRACT)
     with pytest.raises(ValueError, match="resume run"):
         runner.run(store, arguments(feed=["clob-ws"]))
@@ -446,11 +453,11 @@ def test_known_live_interruption_preserves_session_and_starts_new_id(
 
 
 def test_unknown_live_interruption_retains_full_grant(tmp_path, monkeypatch, producer):
-    def crash(store, args):
+    def crash(store, **kwargs):
         store.run_meter.charge_bytes(10)
         raise RuntimeError("unobserved transport termination")
 
-    monkeypatch.setattr(cli, "_record", crash)
+    monkeypatch.setattr(acquisitions, "record", crash)
     store = Store(tmp_path / "root", cli.CONTRACT)
     with pytest.raises(RuntimeError):
         runner.run(store, arguments(feed=["clob-ws"], max_requests=3))
@@ -475,14 +482,14 @@ def test_metadata_limit_crossing_records_actual_reported_usage(tmp_path, monkeyp
     journal = RunJournal(store, settings=runner._settings(arguments(max_requests=7)))
     store.run_meter = journal.meter
     monkeypatch.setattr(
-        runner,
+        metadata_producer,
         "bounded_run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             [], 2, json_bytes({"http_attempts": 9, "downloaded_bytes": 17})
         ),
     )
     with pytest.raises(BudgetExceeded, match="exceeded reserved"):
-        runner.refresh_metadata(store, ["1"], "events")
+        metadata_producer.refresh_metadata(store, ["1"], "events")
     restarted = RunJournal(Store(store.root, cli.CONTRACT), journal.run_id)
     assert restarted.meter.charged == (9, 17)
     assert restarted.data["usage"]["measured_requests"] == 9
@@ -493,7 +500,7 @@ def test_reset_only_live_capture_is_complete_without_observation_readiness(
 ):
     from polymarket_market_data.books import UPDATE_SCHEMA, resets
 
-    def recording(store, args):
+    def recording(store, *, acquisition_id, **kwargs):
         rows = resets(
             [TARGET],
             source="clob-ws",
@@ -503,14 +510,14 @@ def test_reset_only_live_capture_is_complete_without_observation_readiness(
             reason="session_start",
         )
         store.capture(
-            args._acquisition_id,
+            acquisition_id,
             "reset",
             {"book_updates": rows},
             schemas={"book_updates": UPDATE_SCHEMA},
         )
-        return cli._finish(store, args._acquisition_id)
+        return acquisitions._finish(store, acquisition_id)
 
-    monkeypatch.setattr(cli, "_record", recording)
+    monkeypatch.setattr(acquisitions, "record", recording)
     store = Store(tmp_path / "root", cli.CONTRACT)
     report = runner.run(store, arguments(feed=["clob-ws"]))
     source = report["sources"]["clob-ws"]

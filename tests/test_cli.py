@@ -8,7 +8,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from polymarket_market_data import cli, runner
+from polymarket_market_data import acquisitions, cli
+from polymarket_market_data import producer as metadata_producer
 from polymarket_market_data.archives import V1_SCHEMA
 from polymarket_market_data.build import build
 from polymarket_market_data.feeds import PRICE_SCHEMA, coverage
@@ -162,7 +163,7 @@ def test_cli_plan_capture_build_outside_checkout(tmp_path, monkeypatch, capsys):
         return httpx.Response(200, text='{"history": []}')
 
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args, **kwargs, transport=httpx.MockTransport(handler), sleep=lambda _: None
@@ -199,7 +200,7 @@ def test_resume_uses_committed_http_without_repeating_request(tmp_path, monkeypa
         return httpx.Response(200, text='{"history": []}')
 
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args, **kwargs, transport=httpx.MockTransport(handler), sleep=lambda _: None
@@ -229,7 +230,9 @@ def test_paid_disabled_before_http(tmp_path, monkeypatch):
         }
     )
     monkeypatch.setattr(
-        cli, "Client", lambda *args, **kwargs: pytest.fail("made client before paid opt-in")
+        acquisitions,
+        "Client",
+        lambda *args, **kwargs: pytest.fail("made client before paid opt-in"),
     )
     args = cli.parser().parse_args(
         [
@@ -294,10 +297,12 @@ def test_live_metadata_output_is_temporary_and_removed_on_failure(tmp_path, monk
         (output / "unfinished").write_text("source data")
         return SimpleNamespace(returncode=2, stdout="")
 
-    monkeypatch.setattr(runner, "bounded_run", producer)
+    monkeypatch.setattr(metadata_producer, "bounded_run", producer)
     args = SimpleNamespace(events_executable="catalogue", events_root=tmp_path)
     with pytest.raises(ValueError, match="valid resource accounting"):
-        cli._refresh_live_metadata(store, plan_data, args, meter())
+        acquisitions._refresh_live_metadata(
+            store, plan_data, args.events_executable, args.events_root, client=meter()
+        )
     assert seen and not seen[0].exists()
     assert list((store.root / "inputs").iterdir()) == []
 
@@ -318,12 +323,13 @@ def test_live_metadata_success_leaves_only_one_pinned_copy(tmp_path, monkeypatch
             ).decode(),
         )
 
-    monkeypatch.setattr(runner, "bounded_run", producer)
-    bundle = cli._refresh_live_metadata(
+    monkeypatch.setattr(metadata_producer, "bounded_run", producer)
+    bundle = acquisitions._refresh_live_metadata(
         store,
         plan_data,
-        SimpleNamespace(events_executable="catalogue", events_root=tmp_path),
-        meter(),
+        "catalogue",
+        tmp_path,
+        client=meter(),
     )
     assert bundle.path.exists()
     assert list((store.root / "inputs").iterdir()) == [bundle.path]
@@ -351,7 +357,7 @@ def test_backfill_uses_sealed_invocation_request_cap(tmp_path, monkeypatch):
         return httpx.Response(200, json={"history": []})
 
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args, **kwargs, transport=httpx.MockTransport(handler), sleep=lambda _: None
@@ -388,7 +394,7 @@ def test_archive_cli_retained_object_and_repeated_ingestion_semantics(tmp_path, 
     pq.write_table(pa.Table.from_pylist([source], schema=V1_SCHEMA), path)
     payload = path.read_bytes()
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args,
@@ -436,7 +442,7 @@ def test_changed_archive_objects_are_independent_replay_streams(tmp_path, monkey
         pq.write_table(pa.Table.from_pylist([source], schema=V1_SCHEMA), path)
         objects.append(path.read_bytes())
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args,
@@ -467,7 +473,7 @@ def test_crash_after_http_commit_preserves_actual_receive_timestamp(tmp_path, mo
         return httpx.Response(200, json={"history": [{"t": int(NOW.timestamp()), "p": "0.4"}]})
 
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args, **kwargs, transport=httpx.MockTransport(handler), sleep=lambda _: None
@@ -489,7 +495,7 @@ def test_crash_after_http_commit_preserves_actual_receive_timestamp(tmp_path, mo
     acquisition = next((store.root / "acquisitions").iterdir()).name
     committed = store.committed_captures(acquisition_id=acquisition)
     assert len(committed) == 1 and committed[0]["unit_id"].startswith("http-")
-    received = cli.utc(store.read_evidence(committed[0])["received_at"])
+    received = acquisitions.utc(store.read_evidence(committed[0])["received_at"])
     monkeypatch.setattr(Store, "capture", original)
     args.resume = acquisition
     cli.run(args)
@@ -538,7 +544,7 @@ def test_published_live_book_preserves_outcome_ordinal_and_ingestion(tmp_path):
         schemas={"book_updates": UPDATE_SCHEMA},
         coverage=[coverage(TARGET, "clob-ws", NOW, NOW + timedelta(seconds=10), "success")],
     )
-    cli._finish(store, acquisition)
+    acquisitions._finish(store, acquisition)
     release = build(store, plan_id, [acquisition])
     for name in ("book_updates", "book_states"):
         rows = pq.read_table(store.root / "published" / release / (name + ".parquet")).to_pylist()
@@ -593,7 +599,7 @@ def test_partial_archive_resume_keeps_original_object_after_remote_change(tmp_pa
         return httpx.Response(200, content=payloads[min(len(requests) - 1, 1)])
 
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args, **kwargs, transport=httpx.MockTransport(handler), sleep=lambda _: None
@@ -639,12 +645,13 @@ def test_live_metadata_producer_receives_budget_caps(tmp_path, monkeypatch):
             ).decode(),
         )
 
-    monkeypatch.setattr(runner, "bounded_run", producer)
-    cli._refresh_live_metadata(
+    monkeypatch.setattr(metadata_producer, "bounded_run", producer)
+    acquisitions._refresh_live_metadata(
         store,
         plan_data,
-        SimpleNamespace(events_executable="catalogue", events_root=tmp_path),
-        meter(),
+        "catalogue",
+        tmp_path,
+        client=meter(),
     )
 
 
@@ -671,12 +678,16 @@ def test_delegated_metadata_refreshes_share_one_invocation_budget(tmp_path, monk
             ).decode(),
         )
 
-    monkeypatch.setattr(runner, "bounded_run", producer)
+    monkeypatch.setattr(metadata_producer, "bounded_run", producer)
     args = SimpleNamespace(events_executable="catalogue", events_root=tmp_path)
     for _ in range(3):
-        cli._refresh_live_metadata(store, plan_data, args, client)
+        acquisitions._refresh_live_metadata(
+            store, plan_data, args.events_executable, args.events_root, client=client
+        )
     with pytest.raises(BudgetExceeded, match="limit exhausted"):
-        cli._refresh_live_metadata(store, plan_data, args, client)
+        acquisitions._refresh_live_metadata(
+            store, plan_data, args.events_executable, args.events_root, client=client
+        )
     assert requested == [(3, 1024), (2, 960), (1, 896)]
     assert client.requests == 3 and client.downloaded == 192
 
@@ -686,7 +697,7 @@ def test_failed_delegated_metadata_accounts_attempts_and_partial_bytes(tmp_path,
     plan_data = store.load_plan(plan(store))
     client = meter()
     monkeypatch.setattr(
-        runner,
+        metadata_producer,
         "bounded_run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=2,
@@ -696,11 +707,12 @@ def test_failed_delegated_metadata_accounts_attempts_and_partial_bytes(tmp_path,
         ),
     )
     with pytest.raises(ValueError, match="failed or busy"):
-        cli._refresh_live_metadata(
+        acquisitions._refresh_live_metadata(
             store,
             plan_data,
-            SimpleNamespace(events_executable="catalogue", events_root=tmp_path),
-            client,
+            "catalogue",
+            tmp_path,
+            client=client,
         )
     assert client.requests == 2 and client.downloaded == 19
     assert list((store.root / "inputs").iterdir()) == []
@@ -731,7 +743,7 @@ def test_startup_metadata_consumes_last_request_before_ws_connection(tmp_path, m
         clients.append(client)
         return client
 
-    monkeypatch.setattr(cli, "Client", client_factory)
+    monkeypatch.setattr(acquisitions, "Client", client_factory)
 
     def producer(argv, **kwargs):
         assert int(argv[argv.index("--max-requests") + 1]) == 1
@@ -744,13 +756,13 @@ def test_startup_metadata_consumes_last_request_before_ws_connection(tmp_path, m
             ).decode(),
         )
 
-    monkeypatch.setattr(runner, "bounded_run", producer)
+    monkeypatch.setattr(metadata_producer, "bounded_run", producer)
 
     async def record(**kwargs):
         kwargs["charge_request"]()
         pytest.fail("WS connection would exceed the shared invocation cap")
 
-    monkeypatch.setattr(cli, "record", record)
+    monkeypatch.setattr(acquisitions, "record_messages", record)
     args = cli.parser().parse_args(
         [
             "--root",

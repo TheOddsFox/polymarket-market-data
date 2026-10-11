@@ -322,7 +322,8 @@ markets returned only CTF identities, and no usable V2 target was supplied.
 Synthetic position tests establish implementation behavior, not live readiness.
 For archived market discovery by condition, Gamma's default open-market filter
 can omit closed markets; include `closed=true` when looking up historical targets.
-Final-commit CI remains pending separately authorized Git delivery.
+Baseline commit `5631a6585fe997b797f53c74bcb10c9feff08fd6` passed
+[final-commit CI on 10 October 2026](https://github.com/TheOddsFox/polymarket-market-data/actions/runs/38082759843).
 
 ## DuckDB consumers
 
@@ -346,15 +347,15 @@ FROM read_parquet('/absolute/root/published/RELEASE/sampled_ohlc.parquet')
 WHERE source = 'clob-history' AND acquisition_id = 'ACQUISITION'
   AND capture_id = 'CAPTURE' AND asset_kind = 'ctf_token' AND asset_id = 'ASSET';
 
-SELECT received_at, sequence, ordinal, bids, asks, status
+SELECT received_at, sequence, ordinal, best_bid, best_ask, status
 FROM read_parquet('/absolute/root/published/RELEASE/book_states.parquet')
 WHERE source = 'pmxt-v2' AND stream = 'STREAM'
   AND asset_kind = 'ctf_token' AND asset_id = 'ASSET'
 ORDER BY sequence, ordinal;
 
-SELECT venue, asset_kind, asset_id, start, end, status, observations, gaps
+SELECT venue, asset_kind, asset_id, "start", "end", status, observations, gaps
 FROM read_parquet('/absolute/root/published/RELEASE/coverage.parquet')
-WHERE source = 'pmxt-v2' ORDER BY asset_id, start, end;
+WHERE source = 'pmxt-v2' ORDER BY asset_id, "start", "end";
 ```
 
 Coverage rows are non-additive observation receipts: source, typed asset,

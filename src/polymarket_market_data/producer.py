@@ -6,10 +6,13 @@ import os
 import selectors
 import signal
 import subprocess
+import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
-from .foundation import BudgetExceeded
+from .foundation import BudgetExceeded, json_loads
+from .metadata import MAX_BUNDLE, pin_metadata
 
 
 def environment(root, limits=None):
@@ -86,3 +89,91 @@ def bounded_run(argv, *, env, directory, store, timeout=120, max_diagnostics=64 
             except ProcessLookupError:
                 pass
             child.wait()
+
+
+def nonnegative(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("invalid run resource accounting")
+
+
+def refresh_metadata(store, market_ids, events_executable, events_root=None, *, client=None):
+    """Use a fresh managed producer root so ambient configuration cannot choose sources or paths."""
+    meter = getattr(store, "run_meter", None)
+    remaining = (
+        meter.remaining
+        if meter
+        else (
+            store.limits.max_requests - (client.requests if client else 0),
+            store.limits.max_download_bytes - (client.downloaded if client else 0),
+        )
+    )
+    if min(remaining) <= 0:
+        raise BudgetExceeded("metadata refresh request/download limit exhausted")
+    store._budget()
+    retained = sum(path.stat().st_size for path in store.root.rglob("*") if path.is_file())
+    output_budget = min(
+        MAX_BUNDLE,
+        store.limits.max_temp_bytes // 4,
+        (store.limits.max_storage_bytes - retained) // 4,
+    )
+    if output_budget <= 0:
+        raise BudgetExceeded("metadata refresh requires available temporary and retained storage")
+    reservation = meter.reserve(*remaining, "metadata producer") if meter else None
+    with tempfile.TemporaryDirectory(prefix=".metadata-", dir=store.root / ".state") as temporary:
+        directory = Path(temporary) / "bundle"
+        producer_root = Path(temporary) / "events"
+        producer_root.mkdir()
+        argv = [
+            str(events_executable),
+            "metadata",
+            "refresh",
+            "--output",
+            str(directory),
+            "--max-output-bytes",
+            str(output_budget),
+            "--max-response-bytes",
+            str(min(store.limits.max_response_bytes, 8 * 1024**2)),
+            "--max-requests",
+            str(remaining[0]),
+            "--max-download-bytes",
+            str(remaining[1]),
+        ]
+        for market_id in market_ids:
+            argv.extend(["--market-id", market_id])
+        result = bounded_run(
+            argv,
+            env=environment(
+                producer_root,
+                replace(
+                    store.limits,
+                    max_requests=remaining[0],
+                    max_download_bytes=remaining[1],
+                    max_storage_bytes=store.limits.max_storage_bytes - retained - output_budget,
+                    max_temp_bytes=store.limits.max_temp_bytes - output_budget,
+                ),
+            ),
+            directory=temporary,
+            store=store,
+            max_diagnostics=min(64 * 1024, store.limits.max_temp_bytes),
+        )
+        try:
+            reply = json_loads(result.stdout) if result.stdout.strip() else {}
+            if not isinstance(reply, dict):
+                raise ValueError
+            attempts, downloaded = reply["http_attempts"], reply["downloaded_bytes"]
+            nonnegative(attempts)
+            nonnegative(downloaded)
+        except (ValueError, UnicodeError, KeyError):
+            raise ValueError("selected metadata refresh lacks valid resource accounting") from None
+        if client:
+            client.requests += attempts
+            client.downloaded += downloaded
+        if meter:
+            meter.settle(reservation, attempts, downloaded)
+        elif attempts > remaining[0] or downloaded > remaining[1]:
+            raise BudgetExceeded("metadata refresh exceeded invocation request/download budget")
+        if result.returncode:
+            raise ValueError("selected metadata refresh failed or busy")
+        if not isinstance(reply.get("manifest_sha256"), str):
+            raise ValueError("selected metadata refresh lacks manifest digest")
+        return pin_metadata(store.root, directory, reply["manifest_sha256"], store=store)

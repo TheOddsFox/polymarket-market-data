@@ -12,6 +12,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from polymarket_market_data import acceptance, cli, metadata, producer, runner, smoke
+from polymarket_market_data import acquisitions as acquisition_operations
+from polymarket_market_data import producer as metadata_producer
 from polymarket_market_data.books import UPDATE_SCHEMA, normalize_message
 from polymarket_market_data.build import build
 from polymarket_market_data.feeds import PRICE_SCHEMA, coverage
@@ -109,11 +111,17 @@ def pinned(store, directory):
 def test_live_refresh_rejects_every_identity_reassignment(tmp_path, monkeypatch, field, value):
     store = Store(tmp_path / "root", cli.CONTRACT, LIMITS)
     refreshed = bundle([CTF | {field: value}, V2])
-    monkeypatch.setattr(runner, "refresh_metadata", lambda *args, **kwargs: refreshed)
+    monkeypatch.setattr(metadata_producer, "refresh_metadata", lambda *args, **kwargs: refreshed)
     plan = {"assets": [CTF, V2], "market_ids": ["1", "2"], "limits": LIMITS.as_dict()}
     args = SimpleNamespace(events_executable="events", events_root=tmp_path)
     with pytest.raises(ValueError, match="identities changed|lacks validated assets"):
-        cli._refresh_live_metadata(store, plan, args, SimpleNamespace(requests=0, downloaded=0))
+        acquisition_operations._refresh_live_metadata(
+            store,
+            plan,
+            args.events_executable,
+            args.events_root,
+            client=SimpleNamespace(requests=0, downloaded=0),
+        )
 
 
 def test_live_refresh_accepts_labels_and_order_but_preserves_equal_typed_native_ids(
@@ -121,10 +129,15 @@ def test_live_refresh_accepts_labels_and_order_but_preserves_equal_typed_native_
 ):
     store = Store(tmp_path / "root", cli.CONTRACT, LIMITS)
     refreshed = bundle([V2 | {"outcome_label": "Renamed"}, CTF | {"outcome_label": "Changed"}])
-    monkeypatch.setattr(runner, "refresh_metadata", lambda *args, **kwargs: refreshed)
+    monkeypatch.setattr(metadata_producer, "refresh_metadata", lambda *args, **kwargs: refreshed)
     plan = {"assets": [CTF, V2], "market_ids": ["1", "2"], "limits": LIMITS.as_dict()}
     args = SimpleNamespace(events_executable="events", events_root=tmp_path)
-    assert cli._refresh_live_metadata(store, plan, args, None) is refreshed
+    assert (
+        acquisition_operations._refresh_live_metadata(
+            store, plan, args.events_executable, args.events_root, client=None
+        )
+        is refreshed
+    )
     assert plan["assets"] == [CTF, V2]
 
 
@@ -204,15 +217,15 @@ def test_source_returning_success_without_terminal_checkpoint_cannot_promote(
     pointer = store.root / "published" / (previous_plan + ".current.json")
     previous_pointer = pointer.read_bytes()
     metadata = pinned(store, tmp_path / "metadata")
-    monkeypatch.setattr(runner, "refresh_metadata", lambda *args, **kwargs: metadata)
+    monkeypatch.setattr(metadata_producer, "refresh_metadata", lambda *args, **kwargs: metadata)
     calls = []
 
-    def unfinished(store, args):
-        calls.append(args.resume)
-        store.capture(args.resume, "partial", {}, evidence={"observation": "incomplete"})
-        return {"complete": True, "acquisition_id": args.resume}
+    def unfinished(store, *, resume_id, **kwargs):
+        calls.append(resume_id)
+        store.capture(resume_id, "partial", {}, evidence={"observation": "incomplete"})
+        return {"complete": True, "acquisition_id": resume_id}
 
-    monkeypatch.setattr(cli, "_backfill", unfinished)
+    monkeypatch.setattr(acquisition_operations, "backfill", unfinished)
     with pytest.raises(ValueError, match="without committed completion"):
         runner.run(store, arguments())
     journal_path = next(
@@ -340,7 +353,7 @@ def released(tmp_path):
                 for target in (CTF, V2)
             ],
         )
-    cli._finish(store, historical)
+    acquisition_operations._finish(store, historical)
     live = store.new_acquisition(plan_id, "clob-ws")
     updates = []
     for stream in ("first", "reconnect"):
@@ -382,7 +395,7 @@ def released(tmp_path):
             for target in (CTF, V2)
         ],
     )
-    cli._finish(store, live)
+    acquisition_operations._finish(store, live)
     release_id = build(store, plan_id, [historical, live])
     store.publish(release_id)
     return store, plan_id, [historical, live], release_id
@@ -430,7 +443,7 @@ def test_post_publication_failure_restores_same_plan_pointer_and_resumes_without
         },
         schemas={"price_samples": PRICE_SCHEMA},
     )
-    cli._finish(store, historical)
+    acquisition_operations._finish(store, historical)
     queued = build(store, plan_id, [historical, acquisitions[1]])
     assert queued != original_release
     args = arguments(feed=["clob-history", "clob-ws"])
@@ -451,9 +464,10 @@ def test_post_publication_failure_restores_same_plan_pointer_and_resumes_without
     def forbidden(*args, **kwargs):
         pytest.fail("publication recovery repeated metadata, acquisition or build work")
 
-    monkeypatch.setattr(runner, "refresh_metadata", forbidden)
-    for name in ("_backfill", "_archive", "_record", "build"):
-        monkeypatch.setattr(cli, name, forbidden)
+    monkeypatch.setattr(metadata_producer, "refresh_metadata", forbidden)
+    for name in ("backfill", "archive", "record"):
+        monkeypatch.setattr(acquisition_operations, name, forbidden)
+    monkeypatch.setattr(runner, "build", forbidden)
     monkeypatch.setattr(store, "new_acquisition", forbidden)
     args.resume_run = journal.run_id
 

@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from polymarket_market_data import archives, cli
+from polymarket_market_data import acquisitions, archives, cli
 from polymarket_market_data.archives import DECODER_REVISION, V1_SCHEMA, V2_SCHEMA, iter_archive
 from polymarket_market_data.books import UPDATE_SCHEMA
 from polymarket_market_data.build import build
@@ -80,7 +80,7 @@ def setup_cli(tmp_path, monkeypatch, rows):
         return httpx.Response(200, content=payload)
 
     monkeypatch.setattr(
-        cli,
+        acquisitions,
         "Client",
         lambda *args, **kwargs: Client(
             *args, **kwargs, transport=httpx.MockTransport(handler), sleep=lambda _: None
@@ -323,18 +323,18 @@ def test_v2_dictionary_null_optional_fields_and_unknown_assets(tmp_path):
 
 def test_pin_precedes_first_decode_and_resume_does_not_fetch_changed_remote(tmp_path, monkeypatch):
     store, _, args, requests, _ = setup_cli(tmp_path, monkeypatch, [row()])
-    original = cli.iter_archive
+    original = acquisitions.iter_archive
 
     def crash(*args, **kwargs):
         raise RuntimeError("before first parsed row")
 
-    monkeypatch.setattr(cli, "iter_archive", crash)
+    monkeypatch.setattr(acquisitions, "iter_archive", crash)
     with pytest.raises(RuntimeError, match="first parsed"):
         cli.run(args)
     acquisition = next((store.root / "acquisitions").iterdir()).name
     captures = store.committed_captures(acquisition_id=acquisition)
     assert len(captures) == 1 and captures[0]["unit_id"].startswith("source-object-hour-")
-    monkeypatch.setattr(cli, "iter_archive", original)
+    monkeypatch.setattr(acquisitions, "iter_archive", original)
     args.resume = acquisition
     result = cli.run(args)
     assert len(requests) == 1 and result["requests"] == 0

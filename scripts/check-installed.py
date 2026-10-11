@@ -1,5 +1,8 @@
 """Install the built wheel and prove the free workflow outside every checkout, offline."""
 
+if not __debug__:
+    raise SystemExit("installed acceptance requires Python assertions; disable optimization")
+
 import hashlib
 import json
 import os
