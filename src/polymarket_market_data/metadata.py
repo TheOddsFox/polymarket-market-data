@@ -21,7 +21,7 @@ FILES = {
     "identity_history.json",
     "coverage.json",
 }
-MAX_FILE = 32 * 1024**2
+MAX_FILE = 128 * 1024**2
 MAX_BUNDLE = 128 * 1024**2
 KINDS = {"ctf_token", "poly_v2_position"}
 

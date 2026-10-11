@@ -99,7 +99,7 @@ def nonnegative(value):
         raise ValueError("invalid run resource accounting")
 
 
-def refresh_metadata(store, market_ids, events_executable, events_root=None, *, client=None):
+def refresh_metadata(store, market_ids, events_executable, *, client=None):
     """Use a fresh managed producer root so ambient configuration cannot choose sources or paths."""
     meter = getattr(store, "run_meter", None)
     remaining = (

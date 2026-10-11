@@ -114,13 +114,12 @@ def test_live_refresh_rejects_every_identity_reassignment(tmp_path, monkeypatch,
     refreshed = bundle([CTF | {field: value}, V2])
     monkeypatch.setattr(metadata_producer, "refresh_metadata", lambda *args, **kwargs: refreshed)
     plan = {"assets": [CTF, V2], "market_ids": ["1", "2"], "limits": LIMITS.as_dict()}
-    args = SimpleNamespace(events_executable="events", events_root=tmp_path)
+    args = SimpleNamespace(events_executable="events")
     with pytest.raises(ValueError, match="identities changed|lacks validated assets"):
         acquisition_operations._refresh_live_metadata(
             store,
             plan,
             args.events_executable,
-            args.events_root,
             client=SimpleNamespace(requests=0, downloaded=0),
         )
 
@@ -132,10 +131,10 @@ def test_live_refresh_accepts_labels_and_order_but_preserves_equal_typed_native_
     refreshed = bundle([V2 | {"outcome_label": "Renamed"}, CTF | {"outcome_label": "Changed"}])
     monkeypatch.setattr(metadata_producer, "refresh_metadata", lambda *args, **kwargs: refreshed)
     plan = {"assets": [CTF, V2], "market_ids": ["1", "2"], "limits": LIMITS.as_dict()}
-    args = SimpleNamespace(events_executable="events", events_root=tmp_path)
+    args = SimpleNamespace(events_executable="events")
     assert (
         acquisition_operations._refresh_live_metadata(
-            store, plan, args.events_executable, args.events_root, client=None
+            store, plan, args.events_executable, client=None
         )
         is refreshed
     )

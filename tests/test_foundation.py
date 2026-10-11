@@ -8,10 +8,17 @@ from polymarket_market_data.foundation import (
     Limits,
     Store,
     digest,
+    file_info,
     json_bytes,
     read_json,
 )
-from polymarket_market_data.metadata import load_metadata, pin_metadata, select_assets
+from polymarket_market_data.metadata import (
+    MAX_BUNDLE,
+    MAX_FILE,
+    load_metadata,
+    pin_metadata,
+    select_assets,
+)
 from polymarket_market_data.transport import Client, SourceError
 
 CONTRACT = "oddsfox.polymarket.TEST.v1"
@@ -32,7 +39,7 @@ def limits(**changes):
     )
 
 
-def metadata(tmp_path):
+def metadata(tmp_path, *, history=None):
     path = tmp_path / "producer"
     path.mkdir()
     tables = {
@@ -51,7 +58,7 @@ def metadata(tmp_path):
             }
         ],
         "memberships": [],
-        "identity_history": [],
+        "identity_history": history or [],
         "coverage": [{"market_id": "1", "status": "found"}],
     }
     inventory = {}
@@ -82,6 +89,50 @@ def test_pin_survives_producer_removal_and_detects_tamper(tmp_path):
     (bundle.path / "outcomes.json").write_text("[]")
     with pytest.raises(ValueError, match="digest"):
         load_metadata(bundle.path, sha)
+
+
+def test_large_identity_history_is_pinned_and_still_verified(tmp_path):
+    history = [
+        {"market_id": "1", "observation_id": str(index), "raw_outcomes": ["A", "B" * 1024**2]}
+        for index in range(33)
+    ]
+    source, sha = metadata(tmp_path, history=history)
+    assert 32 * 1024**2 < (source / "identity_history.json").stat().st_size < MAX_BUNDLE
+    bundle = pin_metadata(tmp_path / "consumer", source, sha)
+    assert bundle.identity_history == history
+    assert select_assets(bundle)[0]["asset_id"] == "10"
+    with (bundle.path / "identity_history.json").open("r+b") as stream:
+        stream.seek(-2, 2)
+        stream.write(b" ")
+    with pytest.raises(ValueError, match="digest"):
+        load_metadata(bundle.path, sha)
+
+
+@pytest.mark.parametrize("limit", ["file", "bundle"])
+def test_metadata_byte_limits_reject_before_pinning(tmp_path, limit):
+    source, sha = metadata(tmp_path)
+    assert MAX_FILE == MAX_BUNDLE == 128 * 1024**2
+    if limit == "file":
+        with (source / "identity_history.json").open("r+b") as stream:
+            stream.truncate(MAX_FILE + 1)
+        error = "bounded regular files"
+    else:
+        manifest = read_json(source / "manifest.json")
+        for name in ("identity_history.json", "memberships.json"):
+            path = source / name
+            with path.open("wb") as stream:
+                stream.write(b"[]" + b" " * (1024**2 - 2))
+                for _ in range(63):
+                    stream.write(b" " * 1024**2)
+            manifest["files"][name] = file_info(path)
+        raw = json_bytes(manifest)
+        (source / "manifest.json").write_bytes(raw)
+        sha = digest(raw)
+        error = "bundle limit"
+    root = tmp_path / "consumer"
+    with pytest.raises(ValueError, match=error):
+        pin_metadata(root, source, sha)
+    assert not list(root.rglob("manifest.json"))
 
 
 @pytest.mark.parametrize("attack", ["symlink", "unexpected", "manifest"])

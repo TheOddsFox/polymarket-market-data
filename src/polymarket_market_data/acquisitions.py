@@ -783,11 +783,9 @@ def archive(store, *, plan_id, version, resume_id=None):
     }
 
 
-def _refresh_live_metadata(store, plan, events_executable, events_root=None, *, client=None):
+def _refresh_live_metadata(store, plan, events_executable, *, client=None):
     store.limits = Limits.from_dict(plan["limits"])
-    bundle = producer.refresh_metadata(
-        store, plan["market_ids"], events_executable, events_root, client=client
-    )
+    bundle = producer.refresh_metadata(store, plan["market_ids"], events_executable, client=client)
     assets = select_assets(bundle, plan["market_ids"])
     fields = ("venue", "market_id", "asset_kind", "asset_id", "condition_id", "outcome_index")
     if {tuple(row.get(field) for field in fields) for row in assets} != {
@@ -802,7 +800,6 @@ def record(
     *,
     plan_id,
     events_executable,
-    events_root=None,
     acquisition_id=None,
     resume_id=None,
 ):
@@ -815,9 +812,7 @@ def record(
     with Client(
         "clob", store.limits, store=store, run_meter=getattr(store, "run_meter", None)
     ) as client:
-        metadata = _refresh_live_metadata(
-            store, plan, events_executable, events_root, client=client
-        )
+        metadata = _refresh_live_metadata(store, plan, events_executable, client=client)
         acquisition_id = acquisition_id or store.new_acquisition(plan_id, "clob-ws")
         if (
             store.acquisition(acquisition_id)["plan_id"] != plan_id
@@ -842,9 +837,7 @@ def record(
         async def refresh_metadata():
             nonlocal metadata
             # Reconnect after refresh; the next connection requires fresh snapshots.
-            metadata = _refresh_live_metadata(
-                store, plan, events_executable, events_root, client=client
-            )
+            metadata = _refresh_live_metadata(store, plan, events_executable, client=client)
 
         asyncio.run(
             record_messages(

@@ -298,10 +298,10 @@ def test_live_metadata_output_is_temporary_and_removed_on_failure(tmp_path, monk
         return SimpleNamespace(returncode=2, stdout="")
 
     monkeypatch.setattr(metadata_producer, "bounded_run", producer)
-    args = SimpleNamespace(events_executable="catalogue", events_root=tmp_path)
+    args = SimpleNamespace(events_executable="catalogue")
     with pytest.raises(ValueError, match="valid resource accounting"):
         acquisitions._refresh_live_metadata(
-            store, plan_data, args.events_executable, args.events_root, client=meter()
+            store, plan_data, args.events_executable, client=meter()
         )
     assert seen and not seen[0].exists()
     assert list((store.root / "inputs").iterdir()) == []
@@ -328,7 +328,6 @@ def test_live_metadata_success_leaves_only_one_pinned_copy(tmp_path, monkeypatch
         store,
         plan_data,
         "catalogue",
-        tmp_path,
         client=meter(),
     )
     assert bundle.path.exists()
@@ -650,7 +649,6 @@ def test_live_metadata_producer_receives_budget_caps(tmp_path, monkeypatch):
         store,
         plan_data,
         "catalogue",
-        tmp_path,
         client=meter(),
     )
 
@@ -679,15 +677,11 @@ def test_delegated_metadata_refreshes_share_one_invocation_budget(tmp_path, monk
         )
 
     monkeypatch.setattr(metadata_producer, "bounded_run", producer)
-    args = SimpleNamespace(events_executable="catalogue", events_root=tmp_path)
+    args = SimpleNamespace(events_executable="catalogue")
     for _ in range(3):
-        acquisitions._refresh_live_metadata(
-            store, plan_data, args.events_executable, args.events_root, client=client
-        )
+        acquisitions._refresh_live_metadata(store, plan_data, args.events_executable, client=client)
     with pytest.raises(BudgetExceeded, match="limit exhausted"):
-        acquisitions._refresh_live_metadata(
-            store, plan_data, args.events_executable, args.events_root, client=client
-        )
+        acquisitions._refresh_live_metadata(store, plan_data, args.events_executable, client=client)
     assert requested == [(3, 1024), (2, 960), (1, 896)]
     assert client.requests == 3 and client.downloaded == 192
 
@@ -711,7 +705,6 @@ def test_failed_delegated_metadata_accounts_attempts_and_partial_bytes(tmp_path,
             store,
             plan_data,
             "catalogue",
-            tmp_path,
             client=client,
         )
     assert client.requests == 2 and client.downloaded == 19
@@ -773,8 +766,6 @@ def test_startup_metadata_consumes_last_request_before_ws_connection(tmp_path, m
             plan_id,
             "--events-executable",
             "catalogue",
-            "--events-root",
-            str(tmp_path),
         ]
     )
     with pytest.raises(BudgetExceeded, match="request limit"):

@@ -8,6 +8,24 @@ import pytest
 from polymarket_market_data import acquisitions, cli
 
 
+def test_live_record_rejects_removed_events_root_flag(capsys):
+    with pytest.raises(SystemExit) as rejected:
+        cli.parser().parse_args(
+            [
+                "books",
+                "record",
+                "--plan",
+                "sealed-plan",
+                "--events-executable",
+                "events",
+                "--events-root",
+                "events-root",
+            ]
+        )
+    assert rejected.value.code == 2
+    assert "unrecognized arguments: --events-root events-root" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("owner", ["acquisitions", "producer"])
 def test_acquisition_owners_import_without_cli_or_runner(tmp_path, owner):
     code = """
@@ -65,9 +83,9 @@ if forbidden.intersection(sys.modules):
         (["archive", "backfill", "--version", "v1"], "archive", {"version": "v1"}),
         (["archive", "backfill", "--version", "v2"], "archive", {"version": "v2"}),
         (
-            ["books", "record", "--events-executable", "events", "--events-root", "events-root"],
+            ["books", "record", "--events-executable", "events"],
             "record",
-            {"events_executable": "events", "events_root": Path("events-root")},
+            {"events_executable": "events"},
         ),
     ],
 )

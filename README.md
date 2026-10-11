@@ -80,7 +80,7 @@ interrupted live session or metadata subprocess. Never delete or reconstruct a
 run journal to recover allowance. Exhausted runs fail closed. Earlier valid
 publication pointers survive a failed publication.
 
-The producer receives managed paths and explicit budgets. Inherited
+The producer receives a fresh isolated temporary root and explicit budgets. Inherited
 `CATALOGUE_*` configuration and the paid API key are removed; execution is bounded
 to 120 seconds and 64 KiB of diagnostics.
 
@@ -95,6 +95,8 @@ catalogue metadata refresh --market-id 123 --output /absolute/path/metadata
 Use the returned manifest SHA256 as an explicit trusted pin. Select market IDs,
 feeds and a half-open UTC history window. Every valid native outcome of those
 selected markets is included; labels never determine complements.
+Each metadata file and the entire bundle, including its manifest, are limited
+to 128 MiB. Checksums, exact inventory and regular-file checks apply before pinning.
 
 ```sh
 polymarket-market-data --root ./data plan \
@@ -119,8 +121,7 @@ starts when recording begins, independent of the historical window.
 polymarket-market-data --root ./data prices backfill --plan PLAN_ID
 polymarket-market-data --root ./data archive backfill --plan PLAN_ID --version v2
 polymarket-market-data --root ./data books record --plan PLAN_ID \
-  --events-executable /absolute/path/to/catalogue \
-  --events-root /absolute/path/to/polymarket-events
+  --events-executable /absolute/path/to/catalogue
 ```
 
 Live recording refreshes selected metadata through the configured events

@@ -58,7 +58,6 @@ def parser():
             live = actions.add_parser("record")
             _acquisition_flags(live)
             live.add_argument("--events-executable", required=True)
-            live.add_argument("--events-root", type=Path, required=True)
         backfill = actions.add_parser("backfill")
         _acquisition_flags(backfill)
         if name == "archive":
@@ -152,7 +151,6 @@ def _run_locked(store, args):
             store,
             plan_id=args.plan,
             events_executable=args.events_executable,
-            events_root=args.events_root,
             resume_id=args.resume,
         )
     if args.command == "build":

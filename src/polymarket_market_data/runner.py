@@ -450,7 +450,6 @@ def run(store, args):
                             store,
                             plan_id=plan_id,
                             events_executable=settings["events_executable"],
-                            events_root=store.root / ".state",
                             acquisition_id=acquisition_id,
                         )
                         known_termination = True
