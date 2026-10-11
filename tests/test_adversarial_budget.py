@@ -166,3 +166,18 @@ def test_established_root_cannot_reset_after_ledger_and_marker_loss(tmp_path):
     ledger.sentinel.unlink()
     with pytest.raises(ValueError, match="established root"):
         BudgetLedger(store.root, store=store)
+
+
+@pytest.mark.parametrize("name", ["root#tag", "root?mode=rw", "root%20tag", "root with space"])
+@pytest.mark.parametrize("relative", [False, True])
+def test_paid_ledger_uri_characters_preserve_literal_path(tmp_path, monkeypatch, name, relative):
+    monkeypatch.chdir(tmp_path)
+    root = name if relative else tmp_path / name
+    ledger = configured(root, cap=2)
+    assert ledger.status()["allocations"][0]["used"] == 0
+    ledger.reserve("allocated-account", "2026-10", "manual-allocation")
+    reopened = BudgetLedger(root)
+    assert reopened.status()["allocations"][0]["used"] == 1
+    reopened.reserve("allocated-account", "2026-10", "manual-allocation")
+    with pytest.raises(BudgetExceeded):
+        BudgetLedger(root).reserve("allocated-account", "2026-10", "manual-allocation")

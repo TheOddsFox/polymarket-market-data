@@ -1,5 +1,6 @@
 """Adversarial identity, process, accounting, consumer and restore boundaries."""
 
+import json
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -416,14 +417,27 @@ def test_duckdb_consumers_preserve_typed_ids_capture_revisions_and_coverage_rece
 
 
 @pytest.mark.parametrize(
-    "failure", ["after-replacement-oserror", "after-replacement-interrupt", "verify-root"]
+    "failure",
+    [
+        "after-replacement-oserror",
+        "after-replacement-interrupt",
+        "verify-root",
+        "complete",
+        "complete-after-write",
+        "complete-after-write-rollback-journal",
+        "complete-after-write-interrupt-rollback-journal",
+        "report",
+    ],
 )
+@pytest.mark.parametrize("prior_pointer", [True, False])
 def test_post_publication_failure_restores_same_plan_pointer_and_resumes_without_io(
-    released, monkeypatch, failure
+    released, monkeypatch, failure, prior_pointer
 ):
     store, plan_id, acquisitions, original_release = released
     pointer = store.root / "published" / (plan_id + ".current.json")
-    original_pointer = pointer.read_bytes()
+    original_pointer = pointer.read_bytes() if prior_pointer else None
+    if not prior_pointer:
+        store.remove(pointer)
     historical = store.new_acquisition(plan_id, "clob-history")
     store.capture(
         historical,
@@ -474,8 +488,26 @@ def test_post_publication_failure_restores_same_plan_pointer_and_resumes_without
     class Interrupted(BaseException):
         pass
 
-    error = Interrupted if failure == "after-replacement-interrupt" else OSError
+    error = Interrupted if "interrupt" in failure else OSError
     publish, verify = store.publish, store.verify
+    atomic_write = store.atomic_write
+    completion_written = False
+
+    def failed_final_write(path, raw):
+        nonlocal completion_written
+        is_complete = path == journal.path and json.loads(raw)["stage"] == "complete"
+        is_report = (
+            path == journal.path.with_name(journal.run_id + ".report.json")
+            and json.loads(raw)["stage"] == "complete"
+        )
+        if (failure.startswith("complete") and is_complete) or (failure == "report" and is_report):
+            if failure.startswith("complete-after-write"):
+                atomic_write(path, raw)
+                completion_written = True
+            raise error("finalization write failed")
+        if failure.endswith("rollback-journal") and completion_written and path == journal.path:
+            raise OSError("rollback journal write failed")
+        return atomic_write(path, raw)
 
     def failed_publish(release_id):
         publish(release_id)
@@ -484,28 +516,38 @@ def test_post_publication_failure_restores_same_plan_pointer_and_resumes_without
 
     def failed_root_verify(release_id=None):
         result = verify(release_id)
-        if release_id is None and read_json(pointer)["release_id"] == queued:
+        if release_id is None and pointer.exists() and read_json(pointer)["release_id"] == queued:
             raise OSError("root verification failed after pointer replacement")
         return result
 
     with monkeypatch.context() as fault:
         if failure == "verify-root":
             fault.setattr(store, "verify", failed_root_verify)
+        elif failure.startswith("complete") or failure == "report":
+            fault.setattr(store, "atomic_write", failed_final_write)
         else:
             fault.setattr(store, "publish", failed_publish)
         with pytest.raises(Interrupted if error is Interrupted else ValueError):
             runner.run(store, args)
 
-    assert pointer.read_bytes() == original_pointer
+    assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
     assert store.verify(original_release)["release_id"] == original_release
     interrupted = read_json(journal.path)
-    assert interrupted["stage"] == ("verify-root" if failure == "verify-root" else "publish")
+    assert interrupted["stage"] == (
+        "complete"
+        if failure.endswith("rollback-journal")
+        else "verify-root"
+        if failure in ("verify-root", "complete", "complete-after-write", "report")
+        else "publish"
+    )
     assert interrupted["release_id"] == queued
     assert interrupted["usage"] == usage
     assert store.run_meter is None
-    if error is not Interrupted:
+    if error is not Interrupted or failure.endswith("rollback-journal"):
         report_path = journal.path.with_name(journal.run_id + ".report.json")
-        assert read_json(report_path)["stage"] == interrupted["stage"]
+        assert read_json(report_path)["stage"] == (
+            "verify-root" if failure.endswith("rollback-journal") else interrupted["stage"]
+        )
 
     report = runner.run(store, args)
     assert report["stage"] == "complete" and report["release_id"] == queued
@@ -514,6 +556,80 @@ def test_post_publication_failure_restores_same_plan_pointer_and_resumes_without
     assert read_json(journal.path)["usage"] == usage
     assert {path.name for path in (store.root / "acquisitions").iterdir()} == inventory
     assert store.verify()["releases"]
+
+
+@pytest.mark.parametrize(
+    "active_pointer",
+    ["later-release", "absent", "missing-report", "mismatched-report", "invalid-report"],
+)
+def test_completed_resume_does_not_change_subsequent_publication(
+    released, monkeypatch, active_pointer
+):
+    store, plan_id, acquisitions, original_release = released
+    args = arguments(feed=["clob-history", "clob-ws"])
+    journal = RunJournal(store, settings=runner._settings(args))
+    journal.data.update(
+        plan_id=plan_id,
+        acquisitions=dict(zip(args.feed, acquisitions, strict=True)),
+        completed_acquisitions=dict(zip(args.feed, acquisitions, strict=True)),
+        release_id=original_release,
+        stage="complete",
+    )
+    journal.write()
+    runner._report(store, journal, store.verify(original_release), (0, 0))
+    report_path = journal.path.with_name(journal.run_id + ".report.json")
+    if active_pointer == "missing-report":
+        store.remove(report_path)
+    elif active_pointer == "mismatched-report":
+        store.atomic_write(
+            report_path, json_bytes(read_json(report_path) | {"run_id": "another-run"})
+        )
+    if active_pointer == "invalid-report":
+        store.atomic_write(report_path, b"[]")
+    expected_report = report_path.read_bytes() if report_path.exists() else None
+    pointer = store.root / "published" / (plan_id + ".current.json")
+    if active_pointer != "absent":
+        later_acquisition = store.new_acquisition(plan_id, "clob-history")
+        first = next(
+            capture
+            for capture in store.committed_captures(acquisition_id=acquisitions[0])
+            if "price_samples.parquet" in capture["files"]
+        )
+        store.capture(
+            later_acquisition,
+            "later",
+            {"price_samples": store.read_relation(first, "price_samples")},
+            schemas={"price_samples": PRICE_SCHEMA},
+        )
+        acquisition_operations._finish(store, later_acquisition)
+        later_release = build(store, plan_id, [later_acquisition, acquisitions[1]])
+        assert later_release != original_release
+        store.publish(later_release)
+        expected_pointer = pointer.read_bytes()
+    else:
+        store.remove(pointer)
+        expected_pointer = None
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("completed resume must only verify and report its immutable result")
+
+    monkeypatch.setattr(store, "publish", forbidden)
+    monkeypatch.setattr(store, "new_acquisition", forbidden)
+    monkeypatch.setattr(metadata_producer, "refresh_metadata", forbidden)
+    monkeypatch.setattr(runner, "build", forbidden)
+    args.resume_run = journal.run_id
+    if active_pointer in ("missing-report", "mismatched-report", "invalid-report"):
+        for _ in range(2):
+            with pytest.raises(ValueError):
+                runner.run(store, args)
+            assert pointer.read_bytes() == expected_pointer
+            assert (report_path.read_bytes() if report_path.exists() else None) == expected_report
+            assert read_json(journal.path)["stage"] == "complete"
+        return
+    report = runner.run(store, args)
+    assert report["stage"] == "complete" and report["release_id"] == original_release
+    assert report["requests"] == report["downloaded_bytes"] == 0
+    assert (pointer.read_bytes() if pointer.exists() else None) == expected_pointer
 
 
 def modified_release(store, release_id, modify):

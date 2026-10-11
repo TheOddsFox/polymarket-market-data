@@ -357,7 +357,25 @@ def run(store, args):
         )
         store.run_meter = journal.meter
         try:
+            failed_finalization = False
             if journal.data["stage"] == "complete":
+                report_path = journal.path.with_name(journal.run_id + ".report.json")
+                if not report_path.exists():
+                    raise ValueError(
+                        "completed run report missing; reconcile finalization evidence"
+                    )
+                receipt = read_json(report_path)
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("run_id") != journal.run_id
+                    or receipt.get("release_id") != journal.data["release_id"]
+                    or receipt.get("stage") not in ("complete", "verify-root")
+                ):
+                    raise ValueError(
+                        "completed run report disagrees; reconcile finalization evidence"
+                    )
+                failed_finalization = receipt["stage"] == "verify-root"
+            if journal.data["stage"] == "complete" and not failed_finalization:
                 manifest = store.verify(journal.data["release_id"])
                 store.verify()
                 return _report(store, journal, manifest, before)
@@ -473,6 +491,10 @@ def run(store, args):
                     store.publish(journal.data["release_id"])
                     journal.stage("verify-root")
                     store.verify()
+                    journal.data["stage"] = "complete"
+                    report = _report(store, journal, manifest, before)
+                    journal.write()
+                    return report
                 except BaseException:
                     if previous is not None:
                         rollback.release()
@@ -480,11 +502,17 @@ def run(store, args):
                     elif pointer.exists():
                         store.remove(pointer)
                         fsync_dir(pointer.parent)
+                    if journal.data["stage"] == "complete":
+                        journal.data["stage"] = "verify-root"
+                        try:
+                            journal.write()
+                        except (ValueError, OSError):
+                            # Preserve recovery evidence even when interruption skips the outer handler.
+                            _report(store, journal, before=before)
                     raise
-            journal.stage("complete")
-            return _report(store, journal, manifest, before)
         except (ValueError, OSError) as exc:
-            _report(store, journal, before=before)
+            if journal.data["stage"] != "complete":
+                _report(store, journal, before=before)
             raise ValueError(
                 f"{exc if isinstance(exc, ValueError) else 'local operation failed'}; "
                 f"resume run {journal.run_id}; journal {journal.path}"

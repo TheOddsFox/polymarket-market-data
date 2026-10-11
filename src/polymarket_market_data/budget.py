@@ -40,7 +40,9 @@ class BudgetLedger:
 
     def _check(self):
         try:
-            with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as db:
+            with closing(
+                sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True)
+            ) as db:
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("paid ledger corrupted")
                 db.execute(
@@ -193,7 +195,7 @@ class BudgetLedger:
         if not self.path.exists():
             return {"enabled": False, "allocations": []}
         self._check()
-        with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as db:
+        with closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True)) as db:
             rows = db.execute(
                 "SELECT account,period,allowance_id,cap,used FROM allowances ORDER BY account,period"
             ).fetchall()

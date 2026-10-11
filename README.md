@@ -54,6 +54,17 @@ separate from retained bytes and temporary reservations. Stop all writers before
 externally modifying, copying or restoring a root; the next operation inventories
 the resulting files, including orphaned pending files.
 
+Run finalization retains publication rollback protection through the report and
+completion journal writes. After a failed finalization, resume verifies the
+failure evidence and reuses completed acquisitions before publishing again.
+Resuming a completed run preserves any later publication for the same plan. Smoke
+timeouts send SIGTERM so the CLI can reap its isolated producer, then force
+termination after a five-second cleanup grace period. Interrupted reservations
+remain charged; a timeout never reports complete accounting. A missing or
+mismatching completed-run report requires reconciliation before resume. If
+persistent I/O failures prevent both the rollback journal and failure report
+from being saved, reconcile the publication and run evidence before resuming.
+
 ```sh
 polymarket-market-data --root /absolute/path/market-data run --resume-run RUN_ID
 ```

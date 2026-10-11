@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import resource
+import signal
 import subprocess
 import sys
 import threading
@@ -50,13 +51,35 @@ def command(report, name, argv, env=None):
     env = env or {
         key: value for key, value in os.environ.items() if not key.startswith("CATALOGUE_")
     }
-    result = subprocess.run(
+    with subprocess.Popen(
         argv,
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=report.get("command_timeout_seconds", 180),
-    )
+        start_new_session=True,
+    ) as child:
+        try:
+            stdout, stderr = child.communicate(timeout=report.get("command_timeout_seconds", 180))
+        except BaseException:
+            # Let the CLI unwind its independently sessioned producer before forcing exit.
+            try:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    child.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            finally:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+            raise
+        result = subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
     step["exit_code"] = result.returncode
     try:
         value = json.loads(result.stdout)

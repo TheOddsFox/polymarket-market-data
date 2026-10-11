@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import subprocess
+import threading
 from pathlib import Path
 
 from . import acquisitions
@@ -170,6 +172,13 @@ def run(args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+
+    def terminate(signum, frame):
+        raise KeyboardInterrupt("workflow terminated")
+
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGTERM, terminate)
     try:
         result = run(args)
     except (ValueError, OSError, KeyError, subprocess.TimeoutExpired) as exc:
@@ -180,5 +189,8 @@ def main(argv=None):
             ).decode()
         )
         return 2
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
     print(json_bytes(result).decode())
     return 0
