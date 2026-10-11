@@ -173,13 +173,13 @@ def pin_metadata(root, directory, expected_digest, *, store=None):
         temporary = Path(tempfile.mkdtemp(prefix=".pending-", dir=parent))
         try:
             for name, raw in blobs.items():
-                atomic_write(temporary / name, raw)
+                (store.atomic_write if store is not None else atomic_write)(temporary / name, raw)
             load_metadata(temporary, expected_digest)
-            os.rename(temporary, target)
+            (store.rename if store is not None else os.rename)(temporary, target)
             fsync_dir(parent)
         finally:
             if temporary.exists():
-                shutil.rmtree(temporary)
+                (store.remove if store is not None else shutil.rmtree)(temporary)
         return load_metadata(target, expected_digest)
 
 

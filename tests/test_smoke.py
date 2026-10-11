@@ -45,6 +45,23 @@ def test_timeout_does_not_claim_complete_accounting(monkeypatch, tmp_path):
     assert report["error"] == "TimeoutExpired"
 
 
+def test_managed_smoke_report_checks_atomic_peak_and_preserves_existing_report(tmp_path):
+    from dataclasses import replace
+
+    from polymarket_market_data.foundation import BudgetExceeded, Limits, Store
+
+    store = Store(tmp_path / "root", "smoke.test.v1", Limits(10, 10**6, 10**6, 10**5, 10**5))
+    path = store.root / "report.json"
+    store.atomic_write(path, b"previous report")
+    with store.lock:
+        before = store.retained_bytes()
+        store.limits = replace(store.limits, max_storage_bytes=before)
+        with pytest.raises(BudgetExceeded, match="retained storage"):
+            smoke.finish(store.root, {"steps": []}, store=store)
+        assert path.read_bytes() == b"previous report"
+        assert store.retained_bytes() == before
+
+
 def test_output_never_reuses_existing_or_symlink_root(tmp_path):
     with pytest.raises(smoke.SmokeFailure, match="fresh"):
         smoke.new_output(tmp_path)

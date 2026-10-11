@@ -45,6 +45,15 @@ are lifetime totals. Inspect `accounting_complete` and the charged totals before
 claiming exact usage. Coverage includes legitimate empty observations and missing
 hours, which cannot satisfy a nonempty acceptance case.
 
+Storage accounting assumes cooperative single-writer access: every application
+writer must honor the root's writer lock. Each outer writer operation starts with
+a fresh inventory, then tracks actual file bytes and reserves replacement or
+workspace headroom. Nested operations reuse that inventory. Publication and the
+final report reconcile the complete root again. Request/download charges remain
+separate from retained bytes and temporary reservations. Stop all writers before
+externally modifying, copying or restoring a root; the next operation inventories
+the resulting files, including orphaned pending files.
+
 ```sh
 polymarket-market-data --root /absolute/path/market-data run --resume-run RUN_ID
 ```

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import uuid
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +17,6 @@ from .build import build
 from .foundation import (
     BudgetExceeded,
     Limits,
-    atomic_write,
     digest,
     fsync_dir,
     json_bytes,
@@ -170,7 +170,7 @@ class RunJournal:
         if len(raw) > self.store.limits.max_temp_bytes:
             raise BudgetExceeded("run journal temporary budget exhausted")
         self.store._budget(len(raw))
-        atomic_write(self.path, raw)
+        self.store.atomic_write(self.path, raw)
 
     def stage(self, value):
         self.data["stage"] = value
@@ -322,9 +322,7 @@ def _report(store, journal, manifest=None, before=(0, 0)):
             "charged_downloaded_bytes": journal.meter.charged[1],
             "remaining_requests": journal.meter.remaining[0],
             "remaining_downloaded_bytes": journal.meter.remaining[1],
-            "root_storage_bytes": sum(
-                value.stat().st_size for value in store.root.rglob("*") if value.is_file()
-            ),
+            "root_storage_bytes": store.retained_bytes(refresh=True),
         },
         "limits": store.limits.as_dict(),
         "recovery": {
@@ -343,7 +341,7 @@ def _report(store, journal, manifest=None, before=(0, 0)):
     }
     raw = json_bytes(report)
     store._budget(len(raw))
-    atomic_write(path, raw)
+    store.atomic_write(path, raw)
     return report
 
 
@@ -468,17 +466,21 @@ def run(store, args):
             store.verify()
             pointer = store.root / "published" / (plan_id + ".current.json")
             previous = read_bytes(pointer) if pointer.exists() else None
-            try:
-                store.publish(journal.data["release_id"])
-                journal.stage("verify-root")
-                store.verify()
-            except BaseException:
-                if previous is not None:
-                    atomic_write(pointer, previous)
-                elif pointer.exists():
-                    pointer.unlink()
-                    fsync_dir(pointer.parent)
-                raise
+            with (
+                store.external_write([], len(previous)) if previous is not None else nullcontext()
+            ) as rollback:
+                try:
+                    store.publish(journal.data["release_id"])
+                    journal.stage("verify-root")
+                    store.verify()
+                except BaseException:
+                    if previous is not None:
+                        rollback.release()
+                        store.atomic_write(pointer, previous)
+                    elif pointer.exists():
+                        store.remove(pointer)
+                        fsync_dir(pointer.parent)
+                    raise
             journal.stage("complete")
             return _report(store, journal, manifest, before)
         except (ValueError, OSError) as exc:

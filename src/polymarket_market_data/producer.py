@@ -47,48 +47,51 @@ def bounded_run(argv, *, env, directory, store, timeout=120, max_diagnostics=64 
     deadline = time.monotonic() + timeout
     stdout = bytearray()
     diagnostic_bytes = 0
-    with subprocess.Popen(
-        argv,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    ) as child:
-        try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(child.stdout, selectors.EVENT_READ, True)
-                selector.register(child.stderr, selectors.EVENT_READ, False)
-                while selector.get_map() or child.poll() is None:
-                    if time.monotonic() >= deadline:
-                        raise ValueError("selected metadata refresh deadline exhausted")
-                    store._budget()
-                    size = 0
-                    for path in Path(directory).rglob("*"):
-                        if path.is_symlink():
-                            raise ValueError("symlink in metadata producer output")
-                        if path.is_file():
-                            size += path.stat().st_size
-                    if size > store.limits.max_temp_bytes:
-                        raise BudgetExceeded("metadata temporary storage limit exhausted")
-                    for key, _ in selector.select(min(0.1, deadline - time.monotonic())):
-                        data = os.read(key.fileobj.fileno(), 8192)
-                        if not data:
-                            selector.unregister(key.fileobj)
-                            continue
-                        diagnostic_bytes += len(data)
-                        if diagnostic_bytes > max_diagnostics:
-                            raise ValueError(
-                                "selected metadata refresh diagnostics limit exhausted"
-                            )
-                        if key.data:
-                            stdout.extend(data)
-            return subprocess.CompletedProcess(argv, child.wait(), bytes(stdout), b"")
-        finally:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait()
+    allowance = min(store.limits.max_temp_bytes, store.available_bytes())
+    if allowance <= 0:
+        raise BudgetExceeded("metadata temporary storage limit exhausted")
+    try:
+        with store.external_write([Path(directory)], allowance) as workspace:
+            with subprocess.Popen(
+                argv,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            ) as child:
+                try:
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(child.stdout, selectors.EVENT_READ, True)
+                        selector.register(child.stderr, selectors.EVENT_READ, False)
+                        while selector.get_map() or child.poll() is None:
+                            if time.monotonic() >= deadline:
+                                raise ValueError("selected metadata refresh deadline exhausted")
+                            size = workspace.check()
+                            if size > store.limits.max_temp_bytes:
+                                raise BudgetExceeded("metadata temporary storage limit exhausted")
+                            for key, _ in selector.select(min(0.1, deadline - time.monotonic())):
+                                data = os.read(key.fileobj.fileno(), 8192)
+                                if not data:
+                                    selector.unregister(key.fileobj)
+                                    continue
+                                diagnostic_bytes += len(data)
+                                if diagnostic_bytes > max_diagnostics:
+                                    raise ValueError(
+                                        "selected metadata refresh diagnostics limit exhausted"
+                                    )
+                                if key.data:
+                                    stdout.extend(data)
+                    return subprocess.CompletedProcess(argv, child.wait(), bytes(stdout), b"")
+                finally:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
+    except BudgetExceeded:
+        raise BudgetExceeded(
+            "metadata temporary storage or retained storage limit exhausted"
+        ) from None
 
 
 def nonnegative(value):
@@ -110,7 +113,7 @@ def refresh_metadata(store, market_ids, events_executable, events_root=None, *, 
     if min(remaining) <= 0:
         raise BudgetExceeded("metadata refresh request/download limit exhausted")
     store._budget()
-    retained = sum(path.stat().st_size for path in store.root.rglob("*") if path.is_file())
+    retained = store.retained_bytes()
     output_budget = min(
         MAX_BUNDLE,
         store.limits.max_temp_bytes // 4,
@@ -120,60 +123,65 @@ def refresh_metadata(store, market_ids, events_executable, events_root=None, *, 
         raise BudgetExceeded("metadata refresh requires available temporary and retained storage")
     reservation = meter.reserve(*remaining, "metadata producer") if meter else None
     with tempfile.TemporaryDirectory(prefix=".metadata-", dir=store.root / ".state") as temporary:
-        directory = Path(temporary) / "bundle"
-        producer_root = Path(temporary) / "events"
-        producer_root.mkdir()
-        argv = [
-            str(events_executable),
-            "metadata",
-            "refresh",
-            "--output",
-            str(directory),
-            "--max-output-bytes",
-            str(output_budget),
-            "--max-response-bytes",
-            str(min(store.limits.max_response_bytes, 8 * 1024**2)),
-            "--max-requests",
-            str(remaining[0]),
-            "--max-download-bytes",
-            str(remaining[1]),
-        ]
-        for market_id in market_ids:
-            argv.extend(["--market-id", market_id])
-        result = bounded_run(
-            argv,
-            env=environment(
-                producer_root,
-                replace(
-                    store.limits,
-                    max_requests=remaining[0],
-                    max_download_bytes=remaining[1],
-                    max_storage_bytes=store.limits.max_storage_bytes - retained - output_budget,
-                    max_temp_bytes=store.limits.max_temp_bytes - output_budget,
-                ),
-            ),
-            directory=temporary,
-            store=store,
-            max_diagnostics=min(64 * 1024, store.limits.max_temp_bytes),
-        )
         try:
-            reply = json_loads(result.stdout) if result.stdout.strip() else {}
-            if not isinstance(reply, dict):
-                raise ValueError
-            attempts, downloaded = reply["http_attempts"], reply["downloaded_bytes"]
-            nonnegative(attempts)
-            nonnegative(downloaded)
-        except (ValueError, UnicodeError, KeyError):
-            raise ValueError("selected metadata refresh lacks valid resource accounting") from None
-        if client:
-            client.requests += attempts
-            client.downloaded += downloaded
-        if meter:
-            meter.settle(reservation, attempts, downloaded)
-        elif attempts > remaining[0] or downloaded > remaining[1]:
-            raise BudgetExceeded("metadata refresh exceeded invocation request/download budget")
-        if result.returncode:
-            raise ValueError("selected metadata refresh failed or busy")
-        if not isinstance(reply.get("manifest_sha256"), str):
-            raise ValueError("selected metadata refresh lacks manifest digest")
-        return pin_metadata(store.root, directory, reply["manifest_sha256"], store=store)
+            directory = Path(temporary) / "bundle"
+            producer_root = Path(temporary) / "events"
+            producer_root.mkdir()
+            argv = [
+                str(events_executable),
+                "metadata",
+                "refresh",
+                "--output",
+                str(directory),
+                "--max-output-bytes",
+                str(output_budget),
+                "--max-response-bytes",
+                str(min(store.limits.max_response_bytes, 8 * 1024**2)),
+                "--max-requests",
+                str(remaining[0]),
+                "--max-download-bytes",
+                str(remaining[1]),
+            ]
+            for market_id in market_ids:
+                argv.extend(["--market-id", market_id])
+            result = bounded_run(
+                argv,
+                env=environment(
+                    producer_root,
+                    replace(
+                        store.limits,
+                        max_requests=remaining[0],
+                        max_download_bytes=remaining[1],
+                        max_storage_bytes=store.limits.max_storage_bytes - retained - output_budget,
+                        max_temp_bytes=store.limits.max_temp_bytes - output_budget,
+                    ),
+                ),
+                directory=temporary,
+                store=store,
+                max_diagnostics=min(64 * 1024, store.limits.max_temp_bytes),
+            )
+            try:
+                reply = json_loads(result.stdout) if result.stdout.strip() else {}
+                if not isinstance(reply, dict):
+                    raise ValueError
+                attempts, downloaded = reply["http_attempts"], reply["downloaded_bytes"]
+                nonnegative(attempts)
+                nonnegative(downloaded)
+            except (ValueError, UnicodeError, KeyError):
+                raise ValueError(
+                    "selected metadata refresh lacks valid resource accounting"
+                ) from None
+            if client:
+                client.requests += attempts
+                client.downloaded += downloaded
+            if meter:
+                meter.settle(reservation, attempts, downloaded)
+            elif attempts > remaining[0] or downloaded > remaining[1]:
+                raise BudgetExceeded("metadata refresh exceeded invocation request/download budget")
+            if result.returncode:
+                raise ValueError("selected metadata refresh failed or busy")
+            if not isinstance(reply.get("manifest_sha256"), str):
+                raise ValueError("selected metadata refresh lacks manifest digest")
+            return pin_metadata(store.root, directory, reply["manifest_sha256"], store=store)
+        finally:
+            store.remove(Path(temporary))

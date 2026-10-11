@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from contextlib import nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from pathlib import Path
 
 from filelock import FileLock
@@ -40,7 +40,7 @@ class BudgetLedger:
 
     def _check(self):
         try:
-            with sqlite3.connect(f"file:{self.path}?mode=ro", uri=True) as db:
+            with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as db:
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("paid ledger corrupted")
                 db.execute(
@@ -53,10 +53,10 @@ class BudgetLedger:
 
     def _bound_write(self, db):
         if self.store is None or self.store.limits is None:
-            return
-        self.store._budget()
-        size = sum(path.stat().st_size for path in self.store.root.rglob("*") if path.is_file())
-        available = self.store.limits.max_storage_bytes - size
+            return 0
+        available = self.store.available_bytes()
+        if db.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
+            raise ValueError("paid accounting requires rollback-journal mode")
         page_size = db.execute("PRAGMA page_size").fetchone()[0]
         page_count = db.execute("PRAGMA page_count").fetchone()[0]
         # A transaction may journal existing pages and grow both database and journal.
@@ -67,6 +67,31 @@ class BudgetLedger:
         if growth < 4:
             raise BudgetExceeded("paid accounting disk budget exhausted")
         db.execute(f"PRAGMA max_page_count={page_count + growth}")
+        return journal + 2 * growth * page_size + 512
+
+    @contextmanager
+    def _connection(self):
+        if self.store is not None:
+            self.store.retained_bytes()
+        db = sqlite3.connect(self.path)
+        try:
+            db.execute("PRAGMA synchronous=FULL")
+            allowance = self._bound_write(db)
+            paths = [
+                self.path,
+                *(Path(str(self.path) + suffix) for suffix in ("-journal", "-wal", "-shm")),
+            ]
+            with (
+                self.store.external_write(paths, allowance)
+                if self.store is not None and self.store.limits is not None
+                else nullcontext()
+            ):
+                try:
+                    yield db
+                finally:
+                    db.close()
+        finally:
+            db.close()
 
     def configure(self, account, period, allowance_id, cap):
         if (
@@ -85,9 +110,7 @@ class BudgetLedger:
                 self._check()
             new_database = not self.path.exists()
             try:
-                with sqlite3.connect(self.path) as db:
-                    db.execute("PRAGMA synchronous=FULL")
-                    self._bound_write(db)
+                with self._connection() as db:
                     db.execute("BEGIN IMMEDIATE")
                     db.execute(
                         "CREATE TABLE IF NOT EXISTS allowances(account TEXT,period TEXT,allowance_id TEXT,cap INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(account,period))"
@@ -110,7 +133,10 @@ class BudgetLedger:
                     db.commit()
             except (BudgetExceeded, sqlite3.Error) as exc:
                 if new_database and not self.sentinel.exists():
-                    self.path.unlink(missing_ok=True)
+                    if self.store is not None:
+                        self.store.remove(self.path)
+                    else:
+                        self.path.unlink(missing_ok=True)
                 if isinstance(exc, sqlite3.Error):
                     raise BudgetExceeded("paid accounting transaction could not commit") from None
                 raise
@@ -120,15 +146,17 @@ class BudgetLedger:
             finally:
                 os.close(fd)
             if not self.sentinel.exists():
-                atomic_write(self.sentinel, json_bytes({"initialized_at": now()}))
+                (self.store.atomic_write if self.store is not None else atomic_write)(
+                    self.sentinel, json_bytes({"initialized_at": now()})
+                )
             root_marker = self.state / "root.json"
             if root_marker.exists():
                 marker = read_json(root_marker)
                 if marker.get("paid_initialized") is not True:
                     updated = json_bytes({**marker, "paid_initialized": True})
-                    if self.store is not None:
-                        self.store._budget(max(0, len(updated) - root_marker.stat().st_size))
-                    atomic_write(root_marker, updated)
+                    (self.store.atomic_write if self.store is not None else atomic_write)(
+                        root_marker, updated
+                    )
         return self.status()
 
     def reserve(self, account, period, allowance_id):
@@ -138,9 +166,7 @@ class BudgetLedger:
             read_json(self.sentinel)
             self._check()
             try:
-                with sqlite3.connect(self.path) as db:
-                    db.execute("PRAGMA synchronous=FULL")
-                    self._bound_write(db)
+                with self._connection() as db:
                     db.execute("BEGIN IMMEDIATE")
                     row = db.execute(
                         "SELECT allowance_id,cap,used FROM allowances WHERE account=? AND period=?",
@@ -167,7 +193,7 @@ class BudgetLedger:
         if not self.path.exists():
             return {"enabled": False, "allocations": []}
         self._check()
-        with sqlite3.connect(f"file:{self.path}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as db:
             rows = db.execute(
                 "SELECT account,period,allowance_id,cap,used FROM allowances ORDER BY account,period"
             ).fetchall()

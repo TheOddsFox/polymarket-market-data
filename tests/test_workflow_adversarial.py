@@ -627,9 +627,11 @@ def smoke_readiness(monkeypatch, released, case):
             "run_id": "synthetic",
             "requests": 0,
             "downloaded_bytes": 0,
+            "limits": store.load_plan(plan_id)["limits"],
         }
 
     def consumer(*args):
+        assert args[0].limits == Limits.from_dict(store.load_plan(plan_id)["limits"])
         checks.append("consumer")
         return {"checked": True}
 

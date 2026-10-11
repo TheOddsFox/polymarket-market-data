@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -185,7 +186,7 @@ def verify_directory(directory):
 
 
 class _EvidenceLock(FileLock):
-    """Verified source objects live only as long as the outer writer operation."""
+    """Object verification and storage accounting last for one writer operation."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -195,6 +196,7 @@ class _EvidenceLock(FileLock):
         result = super().acquire(*args, **kwargs)
         if self.lock_counter == 1:
             self._object_state.cache = {}
+            self._object_state.storage = {"bytes": None, "reserved": 0, "scopes": []}
         return result
 
     def release(self, force=False):
@@ -203,10 +205,123 @@ class _EvidenceLock(FileLock):
         finally:
             if not self.is_locked:
                 self._object_state.cache = None
+                self._object_state.storage = None
 
     @property
     def object_cache(self):
         return getattr(self._object_state, "cache", None) if self.is_locked else None
+
+    @property
+    def storage(self):
+        return getattr(self._object_state, "storage", None) if self.is_locked else None
+
+
+class _BoundedOutput:
+    """A regular-file sink that charges actual growth, including partial writes."""
+
+    mode = "wb"
+
+    def __init__(self, store, stream, maximum):
+        self.store, self.stream, self.maximum = store, stream, maximum
+        self.size = os.fstat(stream.fileno()).st_size
+
+    @property
+    def closed(self):
+        return self.stream.closed
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.stream.tell()
+
+    def seek(self, offset, whence=0):
+        return self.stream.seek(offset, whence)
+
+    def fileno(self):
+        return self.stream.fileno()
+
+    def flush(self):
+        return self.stream.flush()
+
+    def _bound(self, size):
+        if self.maximum is not None and size > self.maximum:
+            raise BudgetExceeded("bounded output budget exhausted")
+        self.store._budget(max(0, size - self.size))
+
+    def _settle(self):
+        try:
+            size = os.fstat(self.fileno()).st_size
+            if self.store.lock.storage["bytes"] is None:
+                self.store.retained_bytes()
+            else:
+                self.store.lock.storage["bytes"] += size - self.size
+            self.size = size
+        except OSError:
+            self.store.lock.storage["bytes"] = None
+            raise
+        self.store._budget()
+
+    def write(self, data):
+        self._bound(max(self.size, self.tell() + len(data)))
+        try:
+            return self.stream.write(data)
+        finally:
+            self._settle()
+
+    def truncate(self, size=None):
+        size = self.tell() if size is None else size
+        self._bound(size)
+        try:
+            return self.stream.truncate(size)
+        finally:
+            self._settle()
+
+    def close(self):
+        if not self.closed:
+            self.flush()
+            os.fsync(self.fileno())
+            self.stream.close()
+
+
+class _ExternalWrite:
+    """Reserve an isolated writer's growth, then reconcile only its paths."""
+
+    def __init__(self, store, paths, allowance):
+        self.store, self.paths, self.allowance = store, paths, allowance
+        self.original = self.size = sum(store._measure(path) for path in paths)
+        self.remaining, self.released = allowance, False
+
+    def check(self):
+        state = self.store.lock.storage
+        try:
+            size = sum(self.store._measure(path) for path in self.paths)
+        except (OSError, ValueError):
+            state["bytes"] = None
+            raise
+        if state["bytes"] is None:
+            self.store.retained_bytes()
+        # Positive growth consumes reserved headroom rather than charging it twice.
+        state["bytes"] += size - self.size
+        self.size = size
+        growth = max(0, size - self.original)
+        remaining = 0 if self.released else max(0, self.allowance - growth)
+        state["reserved"] += remaining - self.remaining
+        self.remaining = remaining
+        self.store._budget()
+        if growth > self.allowance:
+            raise BudgetExceeded("external writer reservation exhausted")
+        return size
+
+    def release(self):
+        self.store.lock.storage["reserved"] -= self.remaining
+        self.remaining, self.released = 0, True
 
 
 def _fingerprint(path):
@@ -218,7 +333,7 @@ def _fingerprint(path):
 
 class Store:
     def __init__(self, root, contract, limits=None):
-        root = Path(root).absolute()
+        root = Path(os.path.abspath(root))
         for parent in (root, *root.parents):
             if parent.is_symlink():
                 raise ValueError("symlink data root")
@@ -252,7 +367,7 @@ class Store:
                 path.mkdir(exist_ok=True)
             sentinel = root / ".state" / "root.json"
             if not sentinel.exists():
-                atomic_write(sentinel, json_bytes({"contract": contract, "created_at": now()}))
+                self.atomic_write(sentinel, json_bytes({"contract": contract, "created_at": now()}))
             if read_json(sentinel).get("contract") != contract:
                 raise ValueError("wrong data-root contract")
 
@@ -261,17 +376,183 @@ class Store:
             raise ValueError("invalid local identifier")
         return value
 
-    def _budget(self, additional=0):
-        if not self.limits:
-            return
-        size = 0
-        for path in self.root.rglob("*"):
-            if path.is_symlink():
+    def _checked_path(self, path):
+        path = Path(os.path.abspath(path))
+        if not path.is_relative_to(self.root):
+            raise ValueError("storage path outside data root")
+        for parent in (path, *path.parents):
+            if parent.is_symlink():
                 raise ValueError("symlink in data root")
-            if path.is_file():
-                size += path.stat().st_size
-        if size + additional > self.limits.max_storage_bytes:
-            raise BudgetExceeded("retained storage budget exhausted")
+        return path
+
+    def _managed_path(self, path):
+        path = self._checked_path(path)
+        for scope in self.lock.storage["scopes"]:
+            for external in scope.paths:
+                if path.is_relative_to(external) or external.is_relative_to(path):
+                    raise ValueError("managed mutation overlaps external writer")
+        return path
+
+    def _measure(self, path):
+        path = self._checked_path(path)
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return 0
+        if stat.S_ISREG(info.st_mode):
+            return info.st_size
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("non-regular storage path")
+        size = 0
+        with os.scandir(path) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise ValueError("symlink in data root")
+                if stat.S_ISREG(info.st_mode):
+                    size += info.st_size
+                elif stat.S_ISDIR(info.st_mode):
+                    size += self._measure(Path(entry.path))
+                else:
+                    raise ValueError("non-regular storage path")
+        return size
+
+    def retained_bytes(self, refresh=False):
+        with self.lock:
+            state = self.lock.storage
+            if refresh or state["bytes"] is None:
+                if any(scope.paths for scope in state["scopes"]):
+                    raise ValueError("cannot refresh storage inventory during external writes")
+                state["bytes"] = self._measure(self.root)
+            return state["bytes"]
+
+    def _budget(self, additional=0):
+        if isinstance(additional, bool) or not isinstance(additional, int) or additional < 0:
+            raise ValueError("invalid storage allowance")
+        with self.lock:
+            size = self.retained_bytes()
+            if (
+                self.limits
+                and size + self.lock.storage["reserved"] + additional
+                > self.limits.max_storage_bytes
+            ):
+                raise BudgetExceeded("retained storage budget exhausted")
+
+    def available_bytes(self):
+        with self.lock:
+            self._budget()
+            if self.limits is None:
+                raise ValueError("storage limits required for available headroom")
+            return (
+                self.limits.max_storage_bytes
+                - self.retained_bytes()
+                - self.lock.storage["reserved"]
+            )
+
+    def atomic_write(self, path, data):
+        with self.lock:
+            path = self._managed_path(path)
+            old = self._measure(path)
+            self._budget(len(data))
+            state = self.lock.storage
+            state["reserved"] += len(data)
+            try:
+                atomic_write(path, data)
+                state["bytes"] += self._measure(path) - old
+            except BaseException:
+                # An interrupted replacement may leave a temporary file behind.
+                state["bytes"] = None
+                raise
+            finally:
+                state["reserved"] -= len(data)
+
+    @contextmanager
+    def open_output(self, path, *, max_bytes=None):
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
+        ):
+            raise ValueError("invalid output allowance")
+        with self.lock:
+            path = self._managed_path(path)
+            old = self._measure(path)
+            self._budget()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("expected regular output file")
+                os.ftruncate(descriptor, 0)
+                self.lock.storage["bytes"] -= old
+                stream = os.fdopen(descriptor, "w+b", buffering=0)
+            except BaseException:
+                self.lock.storage["bytes"] = None
+                os.close(descriptor)
+                raise
+            sink = _BoundedOutput(self, stream, max_bytes)
+            try:
+                yield sink
+            finally:
+                try:
+                    sink.close()
+                finally:
+                    if not stream.closed:
+                        stream.close()
+
+    def remove(self, path):
+        with self.lock:
+            path = self._managed_path(path)
+            size = self._measure(path)
+            self.retained_bytes()
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            except BaseException:
+                self.lock.storage["bytes"] = None
+                raise
+            self.lock.storage["bytes"] -= size
+
+    def rename(self, source, destination):
+        with self.lock:
+            source, destination = self._managed_path(source), self._managed_path(destination)
+            if source == destination:
+                return
+            self._measure(source)
+            old = self._measure(destination)
+            self._budget()
+            try:
+                os.rename(source, destination)
+                self.lock.storage["bytes"] -= old
+            except BaseException:
+                self.lock.storage["bytes"] = None
+                raise
+
+    @contextmanager
+    def external_write(self, paths, allowance):
+        if isinstance(allowance, bool) or not isinstance(allowance, int) or allowance < 0:
+            raise ValueError("invalid external writer allowance")
+        with self.lock:
+            paths = [self._checked_path(path) for path in paths]
+            state = self.lock.storage
+            active_paths = [path for scope in state["scopes"] for path in scope.paths]
+            for index, path in enumerate(paths):
+                for other in [*paths[:index], *active_paths]:
+                    if path.is_relative_to(other) or other.is_relative_to(path):
+                        raise ValueError("overlapping external writer paths")
+            self._budget(allowance)
+            scope = _ExternalWrite(self, paths, allowance)
+            state["reserved"] += allowance
+            state["scopes"].append(scope)
+            try:
+                yield scope
+            finally:
+                try:
+                    scope.check()
+                finally:
+                    scope.release()
+                    state["scopes"].remove(scope)
 
     def create_plan(self, data):
         Limits.from_dict(data["limits"])
@@ -280,8 +561,7 @@ class Store:
         with self.lock:
             path = self.root / "plans" / (plan_id + ".json")
             if not path.exists():
-                self._budget(len(json_bytes(payload)))
-                atomic_write(path, json_bytes(payload))
+                self.atomic_write(path, json_bytes(payload))
             elif read_bytes(path) != json_bytes(payload):
                 raise ValueError("immutable plan collision")
         return plan_id
@@ -312,8 +592,21 @@ class Store:
             self._budget(len(descriptor))
             directory.mkdir()
             (directory / "captures").mkdir()
-            atomic_write(directory / "acquisition.json", descriptor)
+            self.atomic_write(directory / "acquisition.json", descriptor)
             return acquisition_id
+
+    def _temporary_budget(self, directory, additional=0):
+        size = self._measure(directory)
+        if self.limits and size + additional > self.limits.max_temp_bytes:
+            raise BudgetExceeded("temporary bundle budget exhausted")
+        return None if self.limits is None else self.limits.max_temp_bytes - size
+
+    def _write_parquet(self, path, rows, schema, maximum):
+        _no_float(rows)
+        table = pa.Table.from_pylist(rows, schema=schema)
+        with self.open_output(path, max_bytes=maximum) as sink:
+            pq.write_table(table, sink, compression="zstd")
+        return {"rows": len(rows), "schema": str(table.schema)}
 
     def acquisition(self, acquisition_id):
         return read_json(
@@ -345,18 +638,20 @@ class Store:
             self._budget()
             pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=parent))
             try:
-                atomic_write(pending / "evidence.json", json_bytes(evidence or {}))
+                encoded = json_bytes(evidence or {})
+                self._temporary_budget(pending, len(encoded))
+                self.atomic_write(pending / "evidence.json", encoded)
                 table_info = {}
                 for name, rows in relations.items():
                     self._name(name)
-                    table_info[name] = write_parquet(
-                        pending / (name + ".parquet"), rows, (schemas or {}).get(name)
+                    table_info[name] = self._write_parquet(
+                        pending / (name + ".parquet"),
+                        rows,
+                        (schemas or {}).get(name),
+                        self._temporary_budget(pending),
                     )
                 files = file_inventory(pending)
-                size = sum(f["size"] for f in files.values())
-                if self.limits and size > self.limits.max_temp_bytes:
-                    raise BudgetExceeded("temporary capture budget exhausted")
-                self._budget()  # Includes pending files, without double-counting.
+                self._budget()
                 manifest = {
                     "contract": self.contract + ".capture",
                     "capture_id": capture_id,
@@ -372,14 +667,14 @@ class Store:
                     "files": files,
                 }
                 manifest_bytes = json_bytes(manifest)
-                self._budget(len(manifest_bytes))
-                atomic_write(pending / "manifest.json", manifest_bytes)
-                os.rename(pending, destination)
+                self._temporary_budget(pending, len(manifest_bytes))
+                self.atomic_write(pending / "manifest.json", manifest_bytes)
+                self.rename(pending, destination)
                 fsync_dir(parent)
                 return manifest
             finally:
                 if pending.exists():
-                    shutil.rmtree(pending)
+                    self.remove(pending)
 
     def committed_captures(self, acquisition_id=None, plan_id=None):
         with self.lock:
@@ -425,11 +720,12 @@ class Store:
             destination = self.root / reference["path"]
             if destination.exists():
                 self.object_path(reference)
+                if path != destination:
+                    self.remove(path)
             else:
-                self._budget(0 if path.is_relative_to(self.root) else info["size"])
                 if not path.is_relative_to(self.root / ".state"):
                     raise ValueError("source object must be downloaded inside root state")
-                os.rename(path, destination)
+                self.rename(path, destination)
                 fsync_dir(destination.parent)
                 retained = _fingerprint(destination)
                 if retained[:4] != before[:4]:
@@ -505,20 +801,22 @@ class Store:
         }
         parent = self.root / "published"
         with self.lock:
+            self._budget()
             pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=parent))
             try:
                 for name, rows in relations.items():
                     self._name(name)
-                    write_parquet(pending / (name + ".parquet"), rows, (schemas or {}).get(name))
-                atomic_write(pending / "coverage.json", json_bytes(coverage))
-                atomic_write(pending / "plan.json", json_bytes(plan))
+                    self._write_parquet(
+                        pending / (name + ".parquet"),
+                        rows,
+                        (schemas or {}).get(name),
+                        self._temporary_budget(pending),
+                    )
+                for name, value in (("coverage", coverage), ("plan", plan)):
+                    encoded = json_bytes(value)
+                    self._temporary_budget(pending, len(encoded))
+                    self.atomic_write(pending / (name + ".json"), encoded)
                 self._budget()
-                if (
-                    self.limits
-                    and sum(p.stat().st_size for p in pending.iterdir())
-                    > self.limits.max_temp_bytes
-                ):
-                    raise BudgetExceeded("temporary release budget exhausted")
                 identity["files"] = file_inventory(pending)
                 release_id = digest(json_bytes(identity))
                 destination = parent / release_id
@@ -533,14 +831,14 @@ class Store:
                     "created_at": now(),
                 }
                 manifest_bytes = json_bytes(manifest)
-                self._budget(len(manifest_bytes))
-                atomic_write(pending / "manifest.json", manifest_bytes)
-                os.rename(pending, destination)
+                self._temporary_budget(pending, len(manifest_bytes))
+                self.atomic_write(pending / "manifest.json", manifest_bytes)
+                self.rename(pending, destination)
                 fsync_dir(parent)
                 return release_id
             finally:
                 if pending.exists():
-                    shutil.rmtree(pending)
+                    self.remove(pending)
 
     def verify(self, release_id=None):
         with self.lock:
@@ -638,20 +936,20 @@ class Store:
             path = self.root / "published" / (manifest["plan_id"] + ".current.json")
             encoded = json_bytes(pointer)
             self.limits = Limits.from_dict(self.load_plan(manifest["plan_id"])["limits"])
-            self._budget(max(0, len(encoded) - (path.stat().st_size if path.exists() else 0)))
-            atomic_write(path, encoded)
+            self.retained_bytes(refresh=True)
+            self.atomic_write(path, encoded)
         return pointer
 
     def invalidate(self, release_id, reason):
         with self.lock:
             manifest = self.verify(release_id)
-            atomic_write(
+            self.atomic_write(
                 self.root / "published" / (release_id + ".invalid.json"),
                 json_bytes({"reason": reason, "at": now()}),
             )
             pointer = self.root / "published" / (manifest["plan_id"] + ".current.json")
             if pointer.exists() and read_json(pointer)["release_id"] == release_id:
-                pointer.unlink()
+                self.remove(pointer)
                 fsync_dir(pointer.parent)
 
     def status(self):

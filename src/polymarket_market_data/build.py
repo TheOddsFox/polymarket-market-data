@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import closing
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import duckdb
@@ -25,24 +27,30 @@ def _ordered(store, captures, relation, order):
     if not paths:
         return
     limits = store.limits
-    with (
-        TemporaryDirectory(prefix=".build-", dir=store.root / ".state") as temporary,
-        duckdb.connect() as connection,
-    ):
-        connection.execute("SET threads=1")
-        connection.execute("SET memory_limit=?", [f"{limits.max_temp_bytes // 2}B"])
-        connection.execute("SET temp_directory=?", [temporary])
-        connection.execute("SET max_temp_directory_size=?", [f"{limits.max_temp_bytes // 4}B"])
-        connection.read_parquet(paths, union_by_name=True, filename=True).create_view("source_rows")
-        for batch in connection.execute(
-            "SELECT * FROM source_rows ORDER BY " + order + ", filename"
-        ).to_arrow_reader(batch_size=1024):
-            for row in batch.to_pylist():
-                capture = capture_by_path[row.pop("filename")]
-                if relation == "price_samples":
-                    row["acquisition_id"] = capture["acquisition_id"]
-                    row["capture_id"] = capture["capture_id"]
-                yield row
+    with TemporaryDirectory(prefix=".build-", dir=store.root / ".state") as temporary:
+        allowance = min(limits.max_temp_bytes // 4, store.available_bytes())
+        if allowance <= 0:
+            raise BudgetExceeded("build spill requires retained headroom")
+        try:
+            with store.external_write([Path(temporary)], allowance), duckdb.connect() as connection:
+                connection.execute("SET threads=1")
+                connection.execute("SET memory_limit=?", [f"{limits.max_temp_bytes // 2}B"])
+                connection.execute("SET temp_directory=?", [temporary])
+                connection.execute("SET max_temp_directory_size=?", [f"{allowance}B"])
+                connection.read_parquet(paths, union_by_name=True, filename=True).create_view(
+                    "source_rows"
+                )
+                for batch in connection.execute(
+                    "SELECT * FROM source_rows ORDER BY " + order + ", filename"
+                ).to_arrow_reader(batch_size=1024):
+                    for row in batch.to_pylist():
+                        capture = capture_by_path[row.pop("filename")]
+                        if relation == "price_samples":
+                            row["acquisition_id"] = capture["acquisition_id"]
+                            row["capture_id"] = capture["capture_id"]
+                        yield row
+        finally:
+            store.remove(Path(temporary))
 
 
 def build(store, plan_id, acquisition_ids):
@@ -89,28 +97,31 @@ def build(store, plan_id, acquisition_ids):
 
     groups = defaultdict(list)
     seen = {}
-    for row in _ordered(
-        store, captures, "price_samples", "source, asset_kind, asset_id, source_at, received_at"
-    ):
-        key = (
-            row["source"],
-            row["acquisition_id"],
-            row["capture_id"],
-            *asset_key(row),
-            row["source_at"],
+    with closing(
+        _ordered(
+            store, captures, "price_samples", "source, asset_kind, asset_id, source_at, received_at"
         )
-        if key in seen:
-            if seen[key]["price"] != row["price"]:
-                raise ValueError("conflicting prices inside one capture identity")
-            if any(seen[key][name] != row[name] for name, _ in IDENTITY_FIELDS):
-                raise ValueError("conflicting sample identity inside one capture bucket")
-            continue
-        seen[key] = row
-        append("price_samples", row)
-        bucket = utc(row["source_at"]).replace(second=0, microsecond=0)
-        groups[
-            (row["source"], row["acquisition_id"], row["capture_id"], *asset_key(row), bucket)
-        ].append(row)
+    ) as ordered:
+        for row in ordered:
+            key = (
+                row["source"],
+                row["acquisition_id"],
+                row["capture_id"],
+                *asset_key(row),
+                row["source_at"],
+            )
+            if key in seen:
+                if seen[key]["price"] != row["price"]:
+                    raise ValueError("conflicting prices inside one capture identity")
+                if any(seen[key][name] != row[name] for name, _ in IDENTITY_FIELDS):
+                    raise ValueError("conflicting sample identity inside one capture bucket")
+                continue
+            seen[key] = row
+            append("price_samples", row)
+            bucket = utc(row["source_at"]).replace(second=0, microsecond=0)
+            groups[
+                (row["source"], row["acquisition_id"], row["capture_id"], *asset_key(row), bucket)
+            ].append(row)
     for (source, acquisition_id, capture_id, venue, asset_kind, asset_id, bucket), rows in sorted(
         groups.items()
     ):
@@ -137,52 +148,61 @@ def build(store, plan_id, acquisition_ids):
             },
         )
     books, previous = {}, {}
-    for row in _ordered(
-        store, captures, "book_updates", "source, asset_kind, asset_id, stream, sequence, ordinal"
-    ):
-        key = row["source"], *asset_key(row), row["stream"]
-        position = row["sequence"], row["ordinal"]
-        duplicate = previous.get(key)
-        if duplicate and duplicate[:2] == position:
-            if {
-                name: value
-                for name, value in duplicate[2].items()
-                if name not in ("ingested_at", "acquisition_id", "capture_id")
-            } != {
+    with closing(
+        _ordered(
+            store,
+            captures,
+            "book_updates",
+            "source, asset_kind, asset_id, stream, sequence, ordinal",
+        )
+    ) as ordered:
+        for row in ordered:
+            key = row["source"], *asset_key(row), row["stream"]
+            position = row["sequence"], row["ordinal"]
+            duplicate = previous.get(key)
+            if duplicate and duplicate[:2] == position:
+                if {
+                    name: value
+                    for name, value in duplicate[2].items()
+                    if name not in ("ingested_at", "acquisition_id", "capture_id")
+                } != {
+                    name: value
+                    for name, value in row.items()
+                    if name not in ("ingested_at", "acquisition_id", "capture_id")
+                }:
+                    raise ValueError("conflicting book receive position")
+                continue
+            previous[key] = (*position, row)
+            # Parquet decimal types preserve exact values; metadata remains typed.
+            if row.get("price") is not None:
+                row["price"] = Decimal(row["price"])
+            if row.get("quantity") is not None:
+                row["quantity"] = Decimal(row["quantity"])
+            for side in ("bids", "asks"):
+                if row.get(side) is not None:
+                    row[side] = [
+                        {"price": Decimal(level["price"]), "quantity": Decimal(level["quantity"])}
+                        for level in row[side]
+                    ]
+            append("book_updates", row)
+            append("book_states", books.setdefault(key, Book()).apply(row))
+    seen = {}
+    with closing(
+        _ordered(store, captures, "trades", "source, asset_kind, asset_id, source_at, trade_id")
+    ) as ordered:
+        for row in ordered:
+            key = row["source"], *asset_key(row), row["trade_id"]
+            semantic = {
                 name: value
                 for name, value in row.items()
-                if name not in ("ingested_at", "acquisition_id", "capture_id")
-            }:
-                raise ValueError("conflicting book receive position")
-            continue
-        previous[key] = (*position, row)
-        # Parquet decimal types preserve exact values; metadata remains typed.
-        if row.get("price") is not None:
-            row["price"] = Decimal(row["price"])
-        if row.get("quantity") is not None:
-            row["quantity"] = Decimal(row["quantity"])
-        for side in ("bids", "asks"):
-            if row.get(side) is not None:
-                row[side] = [
-                    {"price": Decimal(level["price"]), "quantity": Decimal(level["quantity"])}
-                    for level in row[side]
-                ]
-        append("book_updates", row)
-        append("book_states", books.setdefault(key, Book()).apply(row))
-    seen = {}
-    for row in _ordered(
-        store, captures, "trades", "source, asset_kind, asset_id, source_at, trade_id"
-    ):
-        key = row["source"], *asset_key(row), row["trade_id"]
-        semantic = {
-            name: value for name, value in row.items() if name not in ("received_at", "ingested_at")
-        }
-        if key in seen:
-            if seen[key] != semantic:
-                raise ValueError("conflicting trade identity in selected captures")
-            continue
-        seen[key] = semantic
-        append("trades", row)
+                if name not in ("received_at", "ingested_at")
+            }
+            if key in seen:
+                if seen[key] != semantic:
+                    raise ValueError("conflicting trade identity in selected captures")
+                continue
+            seen[key] = semantic
+            append("trades", row)
     relations["coverage"] = [
         row | {"start": utc(row["start"]), "end": utc(row["end"])} for row in covered
     ]

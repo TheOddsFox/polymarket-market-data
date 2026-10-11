@@ -80,7 +80,9 @@ def command(report, name, argv, env=None):
     return value
 
 
-def finish(output, report, error=None):
+def finish(output, report, error=None, *, store=None):
+    from .foundation import atomic_write
+
     report["status"] = "failed" if error else "passed"
     if error:
         report["error"] = str(error) if isinstance(error, SmokeFailure) else type(error).__name__
@@ -106,7 +108,8 @@ def finish(output, report, error=None):
         and step["result"].get("accounting_complete", True)
         for step in report["steps"]
     )
-    (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    raw = (json.dumps(report, indent=2) + "\n").encode()
+    (store.atomic_write if store is not None else atomic_write)(output / "report.json", raw)
     print(
         json.dumps(
             {
@@ -229,7 +232,7 @@ def run(
 
     from .acceptance import consumer_check, restore_check
     from .books import asset_key
-    from .foundation import Store
+    from .foundation import Limits, Store
     from .metadata import load_metadata, select_assets
 
     baseline = select_assets(
@@ -279,7 +282,9 @@ def run(
     )
     require(resumed["release_id"] == release, "completed resume changed release")
     store = Store(output, "oddsfox.polymarket.market-data.v1")
-    assets = store.load_plan(plan)["assets"]
+    sealed = store.load_plan(plan)
+    store.limits = Limits.from_dict(sealed["limits"])
+    assets = sealed["assets"]
     require(
         {
             tuple(
@@ -364,7 +369,9 @@ def run(
             )
     consumer = consumer_check(store, release)
     restored = restore_check(store, output.with_name(output.name + "-restored"))
-    restored_store = Store(output.with_name(output.name + "-restored"), store.contract)
+    restored_store = Store(
+        output.with_name(output.name + "-restored"), store.contract, store.limits
+    )
     require(consumer_check(restored_store, release) == consumer, "restored consumer query drift")
     restored_args = [*cli[:-1], str(restored_store.root), *build_args[len(cli) :]]
     require(
@@ -416,7 +423,7 @@ def load_report(path):
 
 
 def main(argv=None):
-    from .foundation import Store
+    from .foundation import Limits, Store
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--events-report", required=True, type=Path)
@@ -434,7 +441,17 @@ def main(argv=None):
         "archive smoke requires explicit --start and --end",
     )
     output = new_output(args.output)
-    Store(output, "oddsfox.polymarket.market-data.v1")
+    store = Store(
+        output,
+        "oddsfox.polymarket.market-data.v1",
+        Limits(
+            100,
+            4 * 1024**3 if args.case == "archive" else 32 * 1024**2,
+            16 * 1024**3 if args.case == "archive" else 256 * 1024**2,
+            16 * 1024**2,
+            2 * 1024**3 if args.case == "archive" else 128 * 1024**2,
+        ),
+    )
     report = {
         "product": "polymarket-market-data",
         "steps": [],
@@ -473,10 +490,10 @@ def main(argv=None):
     except (ValueError, OSError, subprocess.TimeoutExpired, KeyError) as error:
         stopped.set()
         sampling.join()
-        return finish(output, report, error)
+        return finish(output, report, error, store=store)
     stopped.set()
     sampling.join()
-    return finish(output, report)
+    return finish(output, report, store=store)
 
 
 if __name__ == "__main__":

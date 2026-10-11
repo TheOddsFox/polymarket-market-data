@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -144,6 +143,7 @@ def backfill(
         "pmxt" if paid else "clob",
         store.limits,
         storage_root=store.root,
+        store=store,
         paid_ledger=ledger,
         account=account,
         period=period,
@@ -233,6 +233,7 @@ def archive(store, *, plan_id, version, resume_id=None):
         "archive",
         store.limits,
         storage_root=store.root,
+        store=store,
         run_meter=getattr(store, "run_meter", None),
     ) as client:
         for item in archive_hours(plan["start"], plan["end"], version):
@@ -364,7 +365,7 @@ def archive(store, *, plan_id, version, resume_id=None):
                     objects=[object_info],
                 )
             finally:
-                shutil.rmtree(temporary)
+                store.remove(temporary)
     return _finish(store, acquisition_id) | {
         "requests": client.requests,
         "downloaded_bytes": client.downloaded,
@@ -401,7 +402,7 @@ def record(
         raise ValueError("live feed is not in the sealed plan")
     store.limits = Limits.from_dict(plan["limits"])
     with Client(
-        "clob", store.limits, storage_root=store.root, run_meter=getattr(store, "run_meter", None)
+        "clob", store.limits, store=store, run_meter=getattr(store, "run_meter", None)
     ) as client:
         metadata = _refresh_live_metadata(
             store, plan, events_executable, events_root, client=client

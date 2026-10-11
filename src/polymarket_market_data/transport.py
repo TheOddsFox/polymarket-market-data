@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -93,6 +94,7 @@ class Client:
         retries=3,
         sleep=time.sleep,
         storage_root=None,
+        store=None,
         run_meter=None,
     ):
         if source not in {*HOSTS, "rpc"}:
@@ -100,7 +102,12 @@ class Client:
         if not isinstance(retries, int) or not 1 <= retries <= 4:
             raise ValueError("retry attempts must be 1..4")
         self.source, self.limits, self.rpc_url = source, limits, rpc_url
-        self.storage_root = Path(storage_root) if storage_root is not None else None
+        self.storage_root = Path(storage_root).absolute() if storage_root is not None else None
+        if store is not None and self.storage_root not in (None, store.root):
+            raise ValueError("transport budget store/root disagreement")
+        self.store = store
+        if store is not None:
+            self.storage_root = store.root
         self.run_meter = run_meter
         self.paid_ledger, self.account, self.period, self.allowance_id = (
             paid_ledger,
@@ -230,15 +237,28 @@ class Client:
                                 for p in self.storage_root.rglob("*")
                                 if p.is_file()
                             )
-                            if self.storage_root
+                            if destination and self.storage_root and self.store is None
                             else 0
                         )
-                        stream = open(destination, "wb") if destination else None
+                        output = ExitStack()
+                        stream = (
+                            output.enter_context(
+                                self.store.open_output(destination, max_bytes=maximum)
+                                if self.store is not None
+                                else open(destination, "wb")
+                            )
+                            if destination
+                            else None
+                        )
                         try:
                             for chunk in response.iter_bytes():
                                 size += len(chunk)
                                 self._count(len(chunk))
-                                if destination and retained + size > self.limits.max_storage_bytes:
+                                if (
+                                    destination
+                                    and self.store is None
+                                    and retained + size > self.limits.max_storage_bytes
+                                ):
                                     raise BudgetExceeded("retained storage limit exhausted")
                                 if size > maximum:
                                     raise BudgetExceeded("source response/temp limit exhausted")
@@ -261,8 +281,7 @@ class Client:
                                 }
                             )
                         finally:
-                            if stream:
-                                stream.close()
+                            output.close()
             except httpx.HTTPError:
                 if attempt + 1 == self.retries:
                     raise SourceError("failed", "source transport attempts exhausted") from None
@@ -291,6 +310,8 @@ class Client:
 
     def download(self, url, destination):
         destination = Path(destination)
+        if self.store is not None:
+            destination = self.store._checked_path(destination)
         if destination.is_symlink() or destination.parent.is_symlink():
             raise ValueError("symlink download destination")
         destination.parent.mkdir(parents=True, exist_ok=True)
